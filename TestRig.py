@@ -43,6 +43,9 @@ OBSTACLE_PADDING = 8
 
 MAX_PLACEMENT_ATTEMPTS = 200
 
+# Toggle obstacle spawning on/off.
+Obstacles = False
+
 
 # ----------------------------
 # Utility
@@ -217,6 +220,9 @@ class Game:
         self.place_target()
 
     def generate_obstacles(self):
+        if not Obstacles:
+            return []
+
         count = random.randint(MIN_OBSTACLES, MAX_OBSTACLES)
         shape_types = ["rect", "circle", "triangle", "poly"]
 
@@ -336,6 +342,39 @@ class Game:
         score_surf = self.font.render(score_text, True, (230, 230, 230))
         self.screen.blit(surf, (10, 10))
         self.screen.blit(score_surf, (10, 32))
+
+    def getGameState(self):
+        center = self.car.pos
+        half_length = CAR_LENGTH / 2.0
+        half_width = CAR_WIDTH / 2.0
+
+        forward = self.car.forward_vector()
+        right = pygame.Vector2(forward.y, -forward.x)
+
+        front_center = center + forward * half_length
+        back_center = center - forward * half_length
+
+        front_right = front_center + right * half_width
+        front_left = front_center - right * half_width
+        back_right = back_center + right * half_width
+        back_left = back_center - right * half_width
+
+        return {
+            "car_corners": {
+                "front_right": (front_right.x, front_right.y),
+                "back_left": (back_left.x, back_left.y),
+                "back_right": (back_right.x, back_right.y),
+                "front_left": (front_left.x, front_left.y),
+            },
+            "car_direction": {
+                "angle_degrees": self.car.angle,
+                "forward_vector": (forward.x, forward.y),
+            },
+            "target": {
+                "coordinates": self.target.rect.center,
+                "radius": self.target.radius,
+            },
+        }
 
     def run(self):
         running = True
