@@ -6,8 +6,6 @@ python main.py
 
 import math
 import random
-import sys
-
 import pygame
 
 
@@ -93,20 +91,20 @@ class Car:
         rad = math.radians(self.angle)
         return pygame.Vector2(math.cos(rad), -math.sin(rad))
 
-    def update(self, dt, keys):
+    def update(self, dt, action):
         # Store previous state
         self.prev_pos = self.pos.copy()
         self.prev_angle = self.angle
 
-        if keys[pygame.K_a]:
+        if action == 2:
             self.angle += self.rotation_speed * dt
-        if keys[pygame.K_d]:
+        if action == 3:
             self.angle -= self.rotation_speed * dt
 
         direction = self.forward_vector()
-        if keys[pygame.K_w]:
+        if action == 0:
             self.pos += direction * self.speed * dt
-        if keys[pygame.K_s]:
+        if action == 1:
             self.pos -= direction * self.speed * dt
 
     def get_render_data(self):
@@ -198,7 +196,7 @@ class Game:
         pygame.init()
         pygame.display.set_caption("Top-Down Driving")
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-        self.clock = pygame.time.Clock()
+        self.dt = 1.0 / FPS
         self.font = pygame.font.Font(None, 24)
 
         self.car_spawn = (SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
@@ -218,6 +216,7 @@ class Game:
 
         self.obstacles = self.generate_obstacles()
         self.place_target()
+        return self.getGameState()
 
     def generate_obstacles(self):
         if not Obstacles:
@@ -376,47 +375,62 @@ class Game:
             },
         }
 
-    def run(self):
-        running = True
-        while running:
-            dt = self.clock.tick(FPS) / 1000.0
+    def step(self, action):
+        pygame.event.pump()
+        self.car.update(self.dt, action)
 
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
+        terminated = False
+        hit_target = False
 
-            keys = pygame.key.get_pressed()
-            if keys[pygame.K_q]:
-                running = False
+        # Collision checks
+        _car_surface, car_rect, car_mask = self.car.get_render_data()
+        hit_obstacle = self.car_hits_obstacle(car_mask, car_rect)
+        out_of_bounds = not self.keep_car_in_bounds(car_rect)
+        hit_target = self.car_hits_target(car_mask, car_rect)
 
-            self.car.update(dt, keys)
+        if hit_obstacle or out_of_bounds or hit_target:
+            terminated = True
 
-            # Collision checks
-            car_surface, car_rect, car_mask = self.car.get_render_data()
-            if self.car_hits_obstacle(car_mask, car_rect) or not self.keep_car_in_bounds(car_rect):
-                self.car.revert()
-                car_surface, car_rect, car_mask = self.car.get_render_data()
+        if hit_obstacle or out_of_bounds:
+            self.car.revert()
 
-            if self.car_hits_target(car_mask, car_rect):
-                self.reset(collected=True)
-                car_surface, car_rect, car_mask = self.car.get_render_data()
+        if hit_target:
+            self.reset(collected=True)
 
-            # Draw
-            self.screen.fill(FIELD_COLOR)
-            pygame.draw.rect(self.screen, BORDER_COLOR, self.screen.get_rect(), 2)
+        return self.getGameState(), terminated, hit_target
 
-            for obs in self.obstacles:
-                obs.draw(self.screen)
+    def render(self):
+        car_surface, car_rect, _car_mask = self.car.get_render_data()
+        self.screen.fill(FIELD_COLOR)
+        pygame.draw.rect(self.screen, BORDER_COLOR, self.screen.get_rect(), 2)
 
-            self.target.draw(self.screen)
-            self.screen.blit(car_surface, car_rect)
-            self.draw_ui()
+        for obs in self.obstacles:
+            obs.draw(self.screen)
 
-            pygame.display.flip()
-
-        pygame.quit()
-        sys.exit()
+        self.target.draw(self.screen)
+        self.screen.blit(car_surface, car_rect)
+        self.draw_ui()
+        pygame.display.flip()
 
 
 if __name__ == "__main__":
-    Game().run()
+    game = Game()
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+        keys = pygame.key.get_pressed()
+        action = 4
+        if keys[pygame.K_w]:
+            action = 0
+        elif keys[pygame.K_s]:
+            action = 1
+        elif keys[pygame.K_a]:
+            action = 2
+        elif keys[pygame.K_d]:
+            action = 3
+        game.step(action)
+        game.render()
+
+    pygame.quit()
