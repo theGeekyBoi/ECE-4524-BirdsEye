@@ -192,12 +192,17 @@ class Obstacle:
 # Game
 # ----------------------------
 class Game:
-    def __init__(self):
+    def __init__(self, render_mode="human"):
         pygame.init()
-        pygame.display.set_caption("Top-Down Driving")
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.render_mode = render_mode
+        if render_mode == "human":
+            pygame.display.set_caption("Top-Down Driving")
+            self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+            self.font = pygame.font.Font(None, 24)
+        else:
+            self.screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            self.font = None
         self.dt = 1.0 / FPS
-        self.font = pygame.font.Font(None, 24)
 
         self.car_spawn = (SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
         self.car = Car(self.car_spawn)
@@ -335,6 +340,8 @@ class Game:
         return True
 
     def draw_ui(self):
+        if self.render_mode != "human":
+            return
         text = "WASD to drive, Q to quit"
         score_text = f"Targets: {self.score}"
         surf = self.font.render(text, True, (230, 230, 230))
@@ -400,6 +407,8 @@ class Game:
         return self.getGameState(), terminated, hit_target
 
     def render(self):
+        if self.render_mode != "human":
+            return
         car_surface, car_rect, _car_mask = self.car.get_render_data()
         self.screen.fill(FIELD_COLOR)
         pygame.draw.rect(self.screen, BORDER_COLOR, self.screen.get_rect(), 2)
