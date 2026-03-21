@@ -4,8 +4,10 @@ pip install pygame
 python main.py
 """
 
+import argparse
 import math
 import random
+import time
 import pygame
 
 
@@ -192,9 +194,11 @@ class Obstacle:
 # Game
 # ----------------------------
 class Game:
-    def __init__(self, render_mode="human"):
+    def __init__(self, render_mode="human", use_vision_state=False, capture_interval=1.0 / 15.0):
         pygame.init()
         self.render_mode = render_mode
+        self.use_vision_state = use_vision_state
+        self.capture_interval = capture_interval
         if render_mode == "human":
             pygame.display.set_caption("Top-Down Driving")
             self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -209,6 +213,9 @@ class Game:
         self.target = Target((0, 0), TARGET_RADIUS)
         self.obstacles = []
         self.score = 0
+        self.last_capture_time = 0.0
+        self.cached_vision_state = None
+        self.cached_vision_detection = None
 
         self.reset(collected=False)
 
@@ -349,7 +356,38 @@ class Game:
         self.screen.blit(surf, (10, 10))
         self.screen.blit(score_surf, (10, 32))
 
-    def getGameState(self):
+    def _draw_scene(self, surface, include_ui=False):
+        car_surface, car_rect, _car_mask = self.car.get_render_data()
+        surface.fill(FIELD_COLOR)
+        pygame.draw.rect(surface, BORDER_COLOR, surface.get_rect(), 2)
+
+        for obs in self.obstacles:
+            obs.draw(surface)
+
+        self.target.draw(surface)
+        surface.blit(car_surface, car_rect)
+
+        if include_ui and self.font is not None:
+            text = "WASD to drive, Q to quit"
+            score_text = f"Targets: {self.score}"
+            surf = self.font.render(text, True, (230, 230, 230))
+            score_surf = self.font.render(score_text, True, (230, 230, 230))
+            surface.blit(surf, (10, 10))
+            surface.blit(score_surf, (10, 32))
+
+    def capture_screenshot(self):
+        """
+        Capture the current frame for vision processing.
+
+        This is the automatic screenshot source used by getGameState() when
+        use_vision_state=True.
+        """
+        screenshot = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self._draw_scene(screenshot, include_ui=False)
+        return screenshot
+
+    def _geometry_game_state(self):
+        """Ground-truth game state from simulator geometry."""
         center = self.car.pos
         half_length = CAR_LENGTH / 2.0
         half_width = CAR_WIDTH / 2.0
@@ -382,6 +420,41 @@ class Game:
             },
         }
 
+    def _capture_vision_state(self, force=False):
+        """
+        Refresh the cached screenshot-based state at the configured interval.
+        """
+        if not self.use_vision_state:
+            return None
+
+        now = time.perf_counter()
+        if (
+            not force
+            and self.cached_vision_state is not None
+            and (now - self.last_capture_time) < self.capture_interval
+        ):
+            return self.cached_vision_state
+
+        from vision_detector import build_detection_result
+
+        detection = build_detection_result(self.capture_screenshot())
+        self.cached_vision_detection = detection
+        self.cached_vision_state = {
+            "car_corners": detection["car_corners"],
+            "car_direction": detection["car_direction"],
+            "target": {
+                "coordinates": detection["target"]["coordinates"],
+                "radius": detection["target"]["radius"],
+            },
+        }
+        self.last_capture_time = now
+        return self.cached_vision_state
+
+    def getGameState(self):
+        if self.use_vision_state:
+            return self._capture_vision_state()
+        return self._geometry_game_state()
+
     def step(self, action):
         pygame.event.pump()
         self.car.update(self.dt, action)
@@ -409,22 +482,37 @@ class Game:
     def render(self):
         if self.render_mode != "human":
             return
-        car_surface, car_rect, _car_mask = self.car.get_render_data()
-        self.screen.fill(FIELD_COLOR)
-        pygame.draw.rect(self.screen, BORDER_COLOR, self.screen.get_rect(), 2)
-
-        for obs in self.obstacles:
-            obs.draw(self.screen)
-
-        self.target.draw(self.screen)
-        self.screen.blit(car_surface, car_rect)
-        self.draw_ui()
+        self._draw_scene(self.screen, include_ui=True)
         pygame.display.flip()
 
 
-if __name__ == "__main__":
-    game = Game()
+def _format_vision_debug_output(game, full_state=False):
+    detection = game.cached_vision_detection
+    if detection is None:
+        return None
+
+    timestamp = f"{game.last_capture_time:.3f}"
+    if full_state:
+        return (
+            f"[vision {timestamp}] "
+            f"car={detection['car_corners']} "
+            f"heading={detection['car_direction']['angle_degrees']:.2f} "
+            f"target={detection['target']['coordinates']}"
+        )
+
+    state_array = detection["state_array"].tolist()
+    return f"[vision {timestamp}] state_array={state_array}"
+
+
+def run_manual_game(capture_interval=1.0 / 15.0, vision_debug=False, full_state=False):
+    game = Game(
+        render_mode="human",
+        use_vision_state=vision_debug,
+        capture_interval=capture_interval,
+    )
     running = True
+    last_logged_capture_time = None
+
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -439,7 +527,41 @@ if __name__ == "__main__":
             action = 2
         elif keys[pygame.K_d]:
             action = 3
+
         game.step(action)
         game.render()
 
+        if vision_debug and game.last_capture_time != last_logged_capture_time:
+            message = _format_vision_debug_output(game, full_state=full_state)
+            if message is not None:
+                print(message)
+            last_logged_capture_time = game.last_capture_time
+
     pygame.quit()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Top-down driving simulator")
+    parser.add_argument(
+        "--vision-debug",
+        action="store_true",
+        help="Print timestamped vision output whenever a new screenshot is processed.",
+    )
+    parser.add_argument(
+        "--vision-full-state",
+        action="store_true",
+        help="With --vision-debug, print car corners, heading, and target instead of the compact array.",
+    )
+    parser.add_argument(
+        "--capture-interval",
+        type=float,
+        default=1.0 / 15.0,
+        help="Seconds between screenshot captures when vision mode is enabled.",
+    )
+    args = parser.parse_args()
+
+    run_manual_game(
+        capture_interval=args.capture_interval,
+        vision_debug=args.vision_debug,
+        full_state=args.vision_full_state,
+    )

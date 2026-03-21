@@ -53,6 +53,18 @@ Run the simulation manually with WASD controls:
 python TestRig.py
 ```
 
+Print the screenshot-derived state array each time a new capture is processed:
+
+```bash
+python TestRig.py --vision-debug --capture-interval 0.5
+```
+
+Print the expanded vision state instead of the compact array:
+
+```bash
+python TestRig.py --vision-debug --vision-full-state --capture-interval 0.5
+```
+
 ### car_env.py
 
 An OpenAI Gym-style wrapper (`CarEnv`) around `Game` that provides standard
@@ -162,6 +174,51 @@ python TestRig.py
 ```
 
 Drive with WASD. Useful for understanding the task difficulty.
+
+
+### Automatic Screenshot Capture In `getGameState()`
+
+The screenshot detector is now wired directly into `Game.getGameState()`.
+
+Enable it like this:
+
+```python
+from TestRig import Game
+
+game = Game(render_mode="human", use_vision_state=True, capture_interval=1.0 / 15.0)
+```
+
+Or through the environment wrapper:
+
+```python
+from car_env import CarEnv
+
+env = CarEnv(render_mode="human", use_vision_state=True, capture_interval=1.0 / 15.0)
+```
+
+When `use_vision_state=True`:
+
+- the game automatically captures a screenshot every `capture_interval` seconds
+- the screenshot is processed by `vision_detector.py`
+- `getGameState()` returns the screenshot-derived state instead of the direct geometry state
+
+When `use_vision_state=False`, `getGameState()` keeps using the original exact simulator geometry.
+
+### Recommended Capture Frequency
+
+For a screenshot-driven control loop:
+
+- Recommended: `15-20 Hz` capture + processing
+- Acceptable starting point: `10 Hz`
+- Usually unnecessary: above `30 Hz` unless you move to a faster vehicle or more aggressive control
+
+Why: the car moves about `220 px/sec`, so at `15 Hz` it advances about `14.7 px`
+per decision, which is responsive enough for this map while keeping screenshot
+overhead manageable.
+
+For RL specifically, train on simulator state when possible and reserve the
+screenshot detector for deployment or imitation-data collection. Training a DQN
+from screenshots is possible, but it adds vision noise and slows iteration.
 
 ## State Representation
 

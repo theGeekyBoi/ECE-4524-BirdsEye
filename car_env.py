@@ -14,10 +14,14 @@ NUM_ACTIONS = 5
 class CarEnv:
     """OpenAI-Gym-compatible environment wrapping the top-down driving game."""
 
-    def __init__(self, render_mode=None, max_steps=1000):
+    def __init__(self, render_mode=None, max_steps=1000, use_vision_state=False, capture_interval=1.0 / 15.0):
         self.render_mode = render_mode
         self.max_steps = max_steps
-        self.game = Game(render_mode=render_mode or "headless")
+        self.game = Game(
+            render_mode=render_mode or "headless",
+            use_vision_state=use_vision_state,
+            capture_interval=capture_interval,
+        )
         self.steps = 0
         self.prev_distance = None
 
