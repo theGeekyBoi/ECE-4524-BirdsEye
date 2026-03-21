@@ -176,6 +176,51 @@ python TestRig.py
 Drive with WASD. Useful for understanding the task difficulty.
 
 
+### Approach
+
+The new vision-state feature treats the simulator like a real external system:
+instead of reading the car and target positions directly from the game objects,
+it periodically captures screenshots of the rendered frame and reconstructs the state from
+pixels. The detector uses the known visual appearance of the scene to locate
+the playfield, segment the yellow car and blue target, estimate the car's
+heading from the blue front marker, and recover the car corners from the car
+body geometry.
+
+The first step is locating the playable field inside the screenshot. The
+detector searches for pixels close to the dark field color and takes the full
+extent of that region as the playfield bounding box. This lets the system work
+even if the screenshot includes window borders or title bars, because all later
+coordinates are measured relative to the detected field and then translated
+back into screenshot coordinates.
+
+The target is detected by thresholding for the blue target color inside that
+playfield. After building a boolean mask of matching pixels, the detector keeps
+the largest connected blue region and treats that as the target. Its center is
+computed from the centroid of all target pixels, which gives the target
+coordinates. Its radius is estimated from the pixel area by assuming the blob
+is circular.
+
+The car is detected in two parts. First, the yellow body is segmented from the
+playfield using the car body color, and the largest connected yellow region is
+kept as the car body. The body centroid gives the approximate car center.
+Second, the blue front marker is segmented separately using the front-marker
+color. Among the blue regions, the detector chooses the one that best matches
+the expected marker size and lies closest to the yellow body. The vector from
+the yellow body centroid to the blue marker centroid becomes the forward
+direction of the car.
+
+Once the forward direction is known, the detector constructs a perpendicular
+right-hand axis and projects every yellow-body pixel onto those two axes. The
+extreme projections along the forward/backward axis and left/right axis define
+the four corners of the oriented car rectangle. Those corner points are then
+converted back into screenshot-relative `(x, y)` coordinates by adding the
+playfield offset. The heading angle is computed from the forward vector in
+screen coordinates, with `0` degrees pointing east and positive rotation
+matching the simulator convention.
+
+That screenshot-derived result is then passed back through `Game.getGameState()`
+so the rest of the project can keep using the same state interface.
+
 ### Automatic Screenshot Capture In `getGameState()`
 
 The screenshot detector is now wired directly into `Game.getGameState()`.
