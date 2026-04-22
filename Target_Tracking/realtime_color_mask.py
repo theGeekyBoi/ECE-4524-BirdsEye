@@ -41,6 +41,19 @@ def main() -> None:
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask = cv2.inRange(hsv, lower, upper)
 
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                (cx, cy), radius = cv2.minEnclosingCircle(largest_contour)
+                center = (int(cx), int(cy))
+                radius_px = int(radius)
+
+                if radius_px > 0:
+                    cv2.circle(mask, center, radius_px, 255, 2)
+                    print(f"center=({center[0]}, {center[1]}), radius={radius:.2f}")
+
             now = time.perf_counter()
             dt = now - prev_time
             prev_time = now
