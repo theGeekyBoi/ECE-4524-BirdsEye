@@ -10,6 +10,7 @@ simulation toward a physical rover.
 ```
 ECE-4524-BirdsEye/
 ├── TestRig.py          # Pygame simulation (environment, entities, rendering)
+├── physical_detector.py# Overhead-webcam tracker for the real red car + white tape
 ├── car_env.py          # Gym-style wrapper with state flattening and reward shaping
 ├── dqn_agent.py        # Double DQN network, replay buffer, and agent logic
 ├── train.py            # Training loop, evaluation modes, and plotting
@@ -105,6 +106,16 @@ The entry-point script with three modes:
   without graphics, printing per-episode stats and a summary with hit rate,
   average reward, and average steps.
 
+### physical_detector.py
+
+The real-world vision pipeline for a stationary external webcam.
+
+- Treats the full camera image as the drivable map
+- Detects the bright red robot body with color segmentation in HSV space
+- Detects the white tape marker mounted on the front side of the robot
+- Uses the red body for footprint size and the white tape for forward direction
+- Returns the robot corner coordinates in image pixels
+
 ## Installation
 
 ```bash
@@ -175,6 +186,25 @@ python TestRig.py
 
 Drive with WASD. Useful for understanding the task difficulty.
 
+### Detect the physical robot from a webcam
+
+```bash
+python physical_detector.py --camera-index 0 --interval 0.1 --display
+```
+
+This prints a JSON detection every `0.1` seconds and opens an annotated preview.
+Press `q` in the preview window to stop.
+By default it requests a `1920x1080` webcam feed; override with
+`--frame-width` and `--frame-height` if needed.
+
+To test from a saved image instead of a live webcam:
+
+```bash
+python physical_detector.py --input overhead_frame.png --display
+```
+
+The physical detector assumes a white tape marker on the front side of the red robot.
+
 
 ### Approach
 
@@ -220,6 +250,47 @@ matching the simulator convention.
 
 That screenshot-derived result is then passed back through `Game.getGameState()`
 so the rest of the project can keep using the same state interface.
+
+## Physical Camera Approach
+
+For the physical setup, the assumptions change slightly from the simulator:
+the webcam is fixed above the workspace, the entire camera frame is treated as
+the valid map, the robot body is bright red, and the front is marked by a small
+white tape marker. Because of that, the physical detector does not try to
+locate a smaller playfield inside the image. Instead, the image boundaries
+themselves define the map boundaries.
+
+The red top cover is used to recover the robot footprint. The detector converts
+the camera frame into HSV color space and thresholds two red hue bands, since
+red wraps around the hue axis. After a small amount of morphological cleanup,
+the largest remaining red contour is assumed to be the car body. A rotated
+minimum-area rectangle is then fit to that contour, which gives a square-like
+footprint and four candidate corner points in image pixels.
+
+The white tape marker is used to determine which side of that square is the
+front. The detector first localizes the red car body, then searches just around
+that body for a bright low-saturation white blob. The tape should be placed on
+the front side of the robot. The detector then measures the distance from the
+tape center to the four detected car corners and treats the two closest corners
+as the front pair. The heading is computed from the midpoint of that front pair,
+with `0` degrees pointing to the right side of the image.
+
+Once the forward direction is known, the rotated rectangle corners are
+re-ordered into `front_right`, `front_left`, `back_right`, and `back_left`.
+Those values are returned directly in full-frame pixel coordinates, so they can
+be used immediately for control, logging, or as state input to a learning
+system. The detector also returns the image bounds as the map bounds, which
+means:
+
+- left wall = `x = 0`
+- right wall = `x = image_width - 1`
+- top wall = `y = 0`
+- bottom wall = `y = image_height - 1`
+
+From the sample images, two practical takeaways stand out:
+
+- the cover color is closer to pink/salmon than a deep pure red, so the HSV threshold is intentionally broad
+- the camera sees the whole room, so large static objects like the tripod and desks stay in frame, but they should not interfere as long as the robot remains the dominant red object
 
 ### Automatic Screenshot Capture In `getGameState()`
 
