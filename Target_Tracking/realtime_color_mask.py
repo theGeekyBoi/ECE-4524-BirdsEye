@@ -14,11 +14,11 @@ def main() -> None:
     # ---------------- USER TUNING SECTION ----------------
     # Store your desired HSV color target here as [H, S, V].
     # H range: 0-179, S range: 0-255, V range: 0-255.
-    target_hsv = np.array([60, 180, 180], dtype=np.int16)
+    target_hsv = np.array([80, 252, 102], dtype=np.int16)
     # Tolerance controls how wide the accepted range is around target_hsv.
     # Increase values if detection is too strict (missing pixels).
     # Decrease values if detection is too loose (too many false positives).
-    tolerance = np.array([10, 60, 60], dtype=np.int16)
+    tolerance = np.array([18, 80, 60], dtype=np.int16)
     # -----------------------------------------------------
 
     # Compute HSV bounds once from target + tolerance.
