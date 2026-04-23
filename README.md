@@ -10,6 +10,7 @@ simulation toward a physical rover.
 ```
 ECE-4524-BirdsEye/
 ├── TestRig.py          # Pygame simulation (environment, entities, rendering)
+├── physical_detector.py# Overhead-webcam tracker for the real red car + white tape
 ├── car_env.py          # Gym-style wrapper with state flattening and reward shaping
 ├── dqn_agent.py        # Double DQN network, replay buffer, and agent logic
 ├── train.py            # Training loop, evaluation modes, and plotting
@@ -53,6 +54,18 @@ Run the simulation manually with WASD controls:
 python TestRig.py
 ```
 
+Print the screenshot-derived state array each time a new capture is processed:
+
+```bash
+python TestRig.py --vision-debug --capture-interval 0.5
+```
+
+Print the expanded vision state instead of the compact array:
+
+```bash
+python TestRig.py --vision-debug --vision-full-state --capture-interval 0.5
+```
+
 ### car_env.py
 
 An OpenAI Gym-style wrapper (`CarEnv`) around `Game` that provides standard
@@ -92,6 +105,16 @@ The entry-point script with three modes:
 - **`eval-headless`** -- Loads the trained model and runs evaluation episodes
   without graphics, printing per-episode stats and a summary with hit rate,
   average reward, and average steps.
+
+### physical_detector.py
+
+The real-world vision pipeline for a stationary external webcam.
+
+- Treats the full camera image as the drivable map
+- Detects the bright red robot body with color segmentation in HSV space
+- Detects the white tape marker mounted on the front side of the robot
+- Uses the red body for footprint size and the white tape for forward direction
+- Returns the robot corner coordinates in image pixels
 
 ## Installation
 
@@ -162,6 +185,156 @@ python TestRig.py
 ```
 
 Drive with WASD. Useful for understanding the task difficulty.
+
+### Detect the physical robot from a webcam
+
+```bash
+python physical_detector.py --camera-index 0 --interval 0.1 --display
+```
+
+This prints a JSON detection every `0.1` seconds and opens an annotated preview.
+Press `q` in the preview window to stop.
+By default it requests a `1920x1080` webcam feed; override with
+`--frame-width` and `--frame-height` if needed.
+
+To test from a saved image instead of a live webcam:
+
+```bash
+python physical_detector.py --input overhead_frame.png --display
+```
+
+The physical detector assumes a white tape marker on the front side of the red robot.
+
+
+### Approach
+
+The new vision-state feature treats the simulator like a real external system:
+instead of reading the car and target positions directly from the game objects,
+it periodically captures screenshots of the rendered frame and reconstructs the state from
+pixels. The detector uses the known visual appearance of the scene to locate
+the playfield, segment the yellow car and blue target, estimate the car's
+heading from the blue front marker, and recover the car corners from the car
+body geometry.
+
+The first step is locating the playable field inside the screenshot. The
+detector searches for pixels close to the dark field color and takes the full
+extent of that region as the playfield bounding box. This lets the system work
+even if the screenshot includes window borders or title bars, because all later
+coordinates are measured relative to the detected field and then translated
+back into screenshot coordinates.
+
+The target is detected by thresholding for the blue target color inside that
+playfield. After building a boolean mask of matching pixels, the detector keeps
+the largest connected blue region and treats that as the target. Its center is
+computed from the centroid of all target pixels, which gives the target
+coordinates. Its radius is estimated from the pixel area by assuming the blob
+is circular.
+
+The car is detected in two parts. First, the yellow body is segmented from the
+playfield using the car body color, and the largest connected yellow region is
+kept as the car body. The body centroid gives the approximate car center.
+Second, the blue front marker is segmented separately using the front-marker
+color. Among the blue regions, the detector chooses the one that best matches
+the expected marker size and lies closest to the yellow body. The vector from
+the yellow body centroid to the blue marker centroid becomes the forward
+direction of the car.
+
+Once the forward direction is known, the detector constructs a perpendicular
+right-hand axis and projects every yellow-body pixel onto those two axes. The
+extreme projections along the forward/backward axis and left/right axis define
+the four corners of the oriented car rectangle. Those corner points are then
+converted back into screenshot-relative `(x, y)` coordinates by adding the
+playfield offset. The heading angle is computed from the forward vector in
+screen coordinates, with `0` degrees pointing east and positive rotation
+matching the simulator convention.
+
+That screenshot-derived result is then passed back through `Game.getGameState()`
+so the rest of the project can keep using the same state interface.
+
+## Physical Camera Approach
+
+For the physical setup, the assumptions change slightly from the simulator:
+the webcam is fixed above the workspace, the entire camera frame is treated as
+the valid map, the robot body is bright red, and the front is marked by a small
+white tape marker. Because of that, the physical detector does not try to
+locate a smaller playfield inside the image. Instead, the image boundaries
+themselves define the map boundaries.
+
+The red top cover is used to recover the robot footprint. The detector converts
+the camera frame into HSV color space and thresholds two red hue bands, since
+red wraps around the hue axis. After a small amount of morphological cleanup,
+the largest remaining red contour is assumed to be the car body. A rotated
+minimum-area rectangle is then fit to that contour, which gives a square-like
+footprint and four candidate corner points in image pixels.
+
+The white tape marker is used to determine which side of that square is the
+front. The detector first localizes the red car body, then searches just around
+that body for a bright low-saturation white blob. The tape should be placed on
+the front side of the robot. The detector then measures the distance from the
+tape center to the four detected car corners and treats the two closest corners
+as the front pair. The heading is computed from the midpoint of that front pair,
+with `0` degrees pointing to the right side of the image.
+
+Once the forward direction is known, the rotated rectangle corners are
+re-ordered into `front_right`, `front_left`, `back_right`, and `back_left`.
+Those values are returned directly in full-frame pixel coordinates, so they can
+be used immediately for control, logging, or as state input to a learning
+system. The detector also returns the image bounds as the map bounds, which
+means:
+
+- left wall = `x = 0`
+- right wall = `x = image_width - 1`
+- top wall = `y = 0`
+- bottom wall = `y = image_height - 1`
+
+From the sample images, two practical takeaways stand out:
+
+- the cover color is closer to pink/salmon than a deep pure red, so the HSV threshold is intentionally broad
+- the camera sees the whole room, so large static objects like the tripod and desks stay in frame, but they should not interfere as long as the robot remains the dominant red object
+
+### Automatic Screenshot Capture In `getGameState()`
+
+The screenshot detector is now wired directly into `Game.getGameState()`.
+
+Enable it like this:
+
+```python
+from TestRig import Game
+
+game = Game(render_mode="human", use_vision_state=True, capture_interval=1.0 / 15.0)
+```
+
+Or through the environment wrapper:
+
+```python
+from car_env import CarEnv
+
+env = CarEnv(render_mode="human", use_vision_state=True, capture_interval=1.0 / 15.0)
+```
+
+When `use_vision_state=True`:
+
+- the game automatically captures a screenshot every `capture_interval` seconds
+- the screenshot is processed by `vision_detector.py`
+- `getGameState()` returns the screenshot-derived state instead of the direct geometry state
+
+When `use_vision_state=False`, `getGameState()` keeps using the original exact simulator geometry.
+
+### Recommended Capture Frequency
+
+For a screenshot-driven control loop:
+
+- Recommended: `15-20 Hz` capture + processing
+- Acceptable starting point: `10 Hz`
+- Usually unnecessary: above `30 Hz` unless you move to a faster vehicle or more aggressive control
+
+Why: the car moves about `220 px/sec`, so at `15 Hz` it advances about `14.7 px`
+per decision, which is responsive enough for this map while keeping screenshot
+overhead manageable.
+
+For RL specifically, train on simulator state when possible and reserve the
+screenshot detector for deployment or imitation-data collection. Training a DQN
+from screenshots is possible, but it adds vision noise and slows iteration.
 
 ## State Representation
 
