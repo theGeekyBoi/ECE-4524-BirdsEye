@@ -9,6 +9,8 @@ import numpy as np
 DEFAULT_TARGET_HSV = np.array([80, 252, 102], dtype=np.int16)
 DEFAULT_TOLERANCE = np.array([18, 80, 60], dtype=np.int16)
 
+target_hsv = np.array([78, 156, 227], dtype=np.int16)
+
 
 def _hsv_bounds(target_hsv: np.ndarray, tolerance: np.ndarray):
     lower = np.clip(target_hsv - tolerance, [0, 0, 0], [179, 255, 255]).astype(np.uint8)
@@ -18,7 +20,7 @@ def _hsv_bounds(target_hsv: np.ndarray, tolerance: np.ndarray):
 
 def detect_target(
     frame_bgr: np.ndarray,
-    target_hsv: np.ndarray = DEFAULT_TARGET_HSV,
+    target_hsv: np.ndarray = target_hsv,
     tolerance: np.ndarray = DEFAULT_TOLERANCE,
 ) -> dict:
     """
