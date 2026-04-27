@@ -1,0 +1,52 @@
+import serial
+
+COMMANDS = {
+    "0": "255,1,255,1\n",  # Forward
+    "1": "255,0,255,0\n",  # Backward
+    "2": "255,0,255,1\n",  # Rotate left
+    "3": "255,1,255,0\n",  # Rotate right
+    "4": "0,1,0,1\n",  # Stop
+}
+
+PORT = "COM8"  # Check serial connection
+
+
+def main():
+    try:
+        ser = serial.Serial(PORT, 9600, timeout=1)
+
+        print("0: Drive forward")
+        print("1: Drive backward")
+        print("2: Rotate left")
+        print("3: Rotate right")
+        print("4: Stop")
+        print("5: Disconnect\n")
+
+        while True:
+            command = input("Enter your command: ")
+
+            if command == "5":
+                break
+
+            if command not in COMMANDS:
+                print("Invalid command. Try again (0-5)")
+                continue
+
+            msg = COMMANDS[command]
+            ser.write(msg.encode("utf-8"))
+            print(f"Sent: {msg.strip()}")
+
+        # Stop car before disconnecting
+        ser.write(COMMANDS["4"].encode("utf-8"))
+
+    except serial.SerialException as e:
+        print(f"Serial error: {e}")
+
+    finally:
+        if "ser" in locals() and ser.is_open:
+            ser.close()
+            print("Disconnected.")
+
+
+if __name__ == "__main__":
+    main()
