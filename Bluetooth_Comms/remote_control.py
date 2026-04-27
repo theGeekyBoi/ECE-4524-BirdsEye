@@ -10,6 +10,9 @@ COMMANDS = {
 
 PORT = "COM8"  # Check serial connection
 
+def send_command(ser, command):
+    ser.write(COMMANDS[command].encode("utf-8"))
+    print(f"Sent: {COMMANDS[command].strip()}")
 
 def main():
     try:

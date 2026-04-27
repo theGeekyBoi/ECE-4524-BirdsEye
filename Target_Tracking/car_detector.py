@@ -127,13 +127,14 @@ def _build_red_mask(frame_bgr: np.ndarray) -> np.ndarray:
     # The sample robot cover reads as a salmon/pink-red rather than a deep red,
     # so keep the hue windows broad and allow moderate saturation.
     lower_red_1 = np.array([0, 70, 80], dtype=np.uint8)
-    upper_red_1 = np.array([10, 255, 255], dtype=np.uint8)
+    upper_red_1 = np.array([5, 160, 255], dtype=np.uint8)
     lower_red_2 = np.array([170, 70, 80], dtype=np.uint8)
     upper_red_2 = np.array([180, 255, 255], dtype=np.uint8)
 
     mask_1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
-    mask_2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
-    mask = cv2.bitwise_or(mask_1, mask_2)
+    # mask_2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
+    # mask = cv2.bitwise_or(mask_1, mask_2)
+    mask = mask_1
 
     kernel = np.ones((5, 5), dtype=np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
