@@ -123,15 +123,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Seconds between processed frames (default: 1/15).",
     )
     parser.add_argument(
-        "--reach-threshold",
-        type=float,
-        default=45.0,
-        help=(
-            "Pixel distance (in the resized 900x600 map) at which the car is "
-            "considered to have reached the target (default: 45.0)."
-        ),
-    )
-    parser.add_argument(
         "--no-serial",
         action="store_true",
         help=(
@@ -310,21 +301,21 @@ def run(args: argparse.Namespace) -> None:
             vector = _assemble_vector(car, tgt)
             dist_px = _pixel_distance(car, tgt)
 
-            if reached:
-                # Hysteresis: stay 'reached' until the target moves clearly away.
-                if dist_px > args.reach_threshold * 1.4:
-                    print(
-                        f"[BirdsEyeRun] Target moved (dist={dist_px:.1f} px). "
-                        "Resuming driving."
-                    )
-                    reached = False
-            else:
-                if dist_px <= args.reach_threshold:
-                    print(
-                        f"[BirdsEyeRun] TARGET REACHED (dist={dist_px:.1f} px). "
-                        "Holding position. Move the target or press 'q' to quit."
-                    )
-                    reached = True
+            prev_reached = reached
+            reach_radius = float(tgt["radius"])
+            reached = dist_px <= reach_radius
+
+            if reached and not prev_reached:
+                print(
+                    f"[BirdsEyeRun] TARGET REACHED (dist={dist_px:.1f} px <= "
+                    f"radius={reach_radius:.1f} px). Holding position. "
+                    "Move the target or press 'q' to quit."
+                )
+            elif not reached and prev_reached:
+                print(
+                    f"[BirdsEyeRun] Target moved (dist={dist_px:.1f} px > "
+                    f"radius={reach_radius:.1f} px). Resuming driving."
+                )
 
             if reached:
                 action = NO_OP_ACTION
@@ -342,7 +333,7 @@ def run(args: argparse.Namespace) -> None:
                     [
                         f"state={state_label}",
                         f"action={action} ({ACTION_LABELS[action]})",
-                        f"dist={dist_px:6.1f} px  thresh={args.reach_threshold:.1f}",
+                        f"dist={dist_px:6.1f} px  radius={reach_radius:.1f}",
                     ],
                 )
                 cv2.imshow(DEBUG_WINDOW_NAME, view)
@@ -351,7 +342,8 @@ def run(args: argparse.Namespace) -> None:
             else:
                 print(
                     f"[t={now:9.3f}] action={action} ({ACTION_LABELS[action]:<13}) "
-                    f"dist={dist_px:6.1f} px  state={state_label}"
+                    f"dist={dist_px:6.1f} px  radius={reach_radius:.1f} px  "
+                    f"state={state_label}"
                 )
                 if _check_quit_headless():
                     break
