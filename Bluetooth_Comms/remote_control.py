@@ -8,7 +8,7 @@ COMMANDS = {
     "4": "0,1,0,1\n",  # Stop
 }
 
-PORT = "COM8"  # Check serial connection
+PORT = "COM3"  # Check serial connection
 
 def send_command(ser, command):
     ser.write(COMMANDS[command].encode("utf-8"))
