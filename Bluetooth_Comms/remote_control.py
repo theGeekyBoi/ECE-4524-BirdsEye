@@ -1,3 +1,4 @@
+import argparse
 import serial
 
 COMMANDS = {
@@ -8,15 +9,24 @@ COMMANDS = {
     "4": "0,1,0,1\n",  # Stop
 }
 
-PORT = "COM3"  # Check serial connection
 
 def send_command(ser, command):
     ser.write(COMMANDS[command].encode("utf-8"))
     print(f"Sent: {COMMANDS[command].strip()}")
 
+
 def main():
+    parser = argparse.ArgumentParser(description="Remote control for Bluetooth car.")
+    parser.add_argument(
+        "--port",
+        type=str,
+        default="COM8",
+        help="Serial port for the Bluetooth connection (default: COM8)",
+    )
+    args = parser.parse_args()
+
     try:
-        ser = serial.Serial(PORT, 9600, timeout=1)
+        ser = serial.Serial(args.port, 9600, timeout=1)
 
         print("0: Drive forward")
         print("1: Drive backward")
