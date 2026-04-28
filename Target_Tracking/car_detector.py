@@ -389,7 +389,7 @@ class DetectionSmoother:
         self.min_deg = min_heading_change_deg
         self._fwd:    np.ndarray | None = None
         self._center: np.ndarray | None = None
-        self._last_out: None
+        self._last_out = None
         self.max_center_jump_px = 150.0
 
     def reset(self):

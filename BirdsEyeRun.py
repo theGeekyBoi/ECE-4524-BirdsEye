@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(HERE, "Target_Tracking"))
 sys.path.insert(0, os.path.join(HERE, "Bluetooth_Comms"))
 
 from car_detector import (  # noqa: E402
+    DetectionSmoother,
     _configure_capture,
     _open_camera,
     detect_physical_car,
@@ -75,6 +76,8 @@ ACTION_LABELS = {
 }
 
 NO_OP_ACTION = 4
+
+TARGET_RADIUS_BUFFER = 1.20
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -238,6 +241,7 @@ def run(args: argparse.Namespace) -> None:
     else:
         print("[BirdsEyeRun] Headless mode active. Press 'q' in this terminal to quit.")
 
+    smoother = DetectionSmoother()
     reached = False
     last_tick = 0.0
 
@@ -265,7 +269,7 @@ def run(args: argparse.Namespace) -> None:
             failure_reason: str | None = None
 
             try:
-                car = detect_physical_car(resized)
+                car, _ = detect_physical_car(resized)
             except ValueError as exc:
                 failure_reason = f"[car] not detected: {exc}"
 
@@ -299,6 +303,9 @@ def run(args: argparse.Namespace) -> None:
                     if _check_quit_headless():
                         break
                 continue
+
+            car = smoother.update(car)
+            tgt["radius"] = float(tgt["radius"]) * TARGET_RADIUS_BUFFER
 
             vector = _assemble_vector(car, tgt)
             dist_px = _pixel_distance(car, tgt)
