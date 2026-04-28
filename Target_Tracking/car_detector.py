@@ -26,6 +26,14 @@ WINDOW_NAME = "Physical Car Detection"
 DEFAULT_FRAME_WIDTH = 1920
 DEFAULT_FRAME_HEIGHT = 1080
 
+# ── Smoothing parameters ────────────────────────────────────────────────────
+# Higher alpha = more responsive but jitterier.  Lower = smoother but laggier.
+HEADING_ALPHA = 0.25   # EMA weight for the new forward-vector sample
+POSITION_ALPHA = 0.30  # EMA weight for the new center-position sample
+# Ignore heading updates smaller than this many degrees (deadband).
+MIN_HEADING_CHANGE_DEG = 2.5
+# ────────────────────────────────────────────────────────────────────────────
+
 
 def _to_serializable(value):
     if isinstance(value, np.ndarray):
@@ -49,9 +57,7 @@ def _draw_text_box(
     thickness: int = 2,
     padding: int = 6,
 ):
-    """
-    Draw text on top of a solid rectangle so it stays visible after preview scaling.
-    """
+    """Draw text on top of a solid rectangle so it stays visible after preview scaling."""
     font = cv2.FONT_HERSHEY_SIMPLEX
     (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     x, y = origin
@@ -61,20 +67,17 @@ def _draw_text_box(
     bottom = min(image.shape[0] - 1, y + baseline + padding)
 
     cv2.rectangle(image, (left, top), (right, bottom), box_color, -1)
-    cv2.putText(
-        image,
-        text,
-        (x, y),
-        font,
-        font_scale,
-        text_color,
-        thickness,
-        cv2.LINE_AA,
-    )
+    cv2.putText(image, text, (x, y), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
 
 def _heading_from_vector(forward_vector: np.ndarray) -> float:
     return (math.degrees(math.atan2(-forward_vector[1], forward_vector[0])) + 360.0) % 360.0
+
+
+def _angle_between_vectors_deg(v1: np.ndarray, v2: np.ndarray) -> float:
+    """Unsigned angle in degrees between two unit vectors."""
+    dot = float(np.clip(v1 @ v2, -1.0, 1.0))
+    return math.degrees(math.acos(dot))
 
 
 def _running_in_wsl() -> bool:
@@ -88,11 +91,6 @@ def _camera_open_error(camera_index: int) -> RuntimeError:
     ):
         return RuntimeError(
             "Could not open camera index "
-            f"{camera_index}. No /dev/video* devices are available inside WSL2. "
-            "Your NexiGo webcam is visible to Windows, but it is not currently exposed "
-            "to this Linux environment. The simplest fix is to run physical_detector.py "
-            "from Windows Python instead of WSL, or attach the USB webcam to WSL with "
-            "USB passthrough."
         )
     return RuntimeError(f"Could not open camera index {camera_index}.")
 
@@ -105,11 +103,7 @@ def _open_camera(camera_index: int) -> cv2.VideoCapture:
     return capture
 
 
-def _configure_capture(
-    capture: cv2.VideoCapture,
-    frame_width: int,
-    frame_height: int,
-):
+def _configure_capture(capture: cv2.VideoCapture, frame_width: int, frame_height: int):
     if hasattr(cv2, "VideoWriter_fourcc"):
         capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
@@ -124,8 +118,6 @@ def _prepare_preview_window(image: np.ndarray):
 def _build_red_mask(frame_bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-    # The sample robot cover reads as a salmon/pink-red rather than a deep red,
-    # so keep the hue windows broad and allow moderate saturation.
     lower_red_1 = np.array([0, 70, 80], dtype=np.uint8)
     upper_red_1 = np.array([5, 160, 255], dtype=np.uint8)
     lower_red_2 = np.array([170, 70, 80], dtype=np.uint8)
@@ -145,7 +137,6 @@ def _build_red_mask(frame_bgr: np.ndarray) -> np.ndarray:
 def _build_white_mask(frame_bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-    # White tape should be bright and relatively low-saturation.
     lower_white = np.array([0, 0, 170], dtype=np.uint8)
     upper_white = np.array([180, 90, 255], dtype=np.uint8)
 
@@ -168,9 +159,7 @@ def _crop_with_padding(frame: np.ndarray, bbox: tuple[int, int, int, int], paddi
 
 
 def detect_red_body(frame_bgr: np.ndarray, min_area: float = 400.0) -> dict:
-    """
-    Detect the red car body and approximate it with a rotated rectangle.
-    """
+    """Detect the red car body and approximate it with a rotated rectangle."""
     mask = _build_red_mask(frame_bgr)
     contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -207,9 +196,7 @@ def detect_white_marker_near_body(
     min_area: float = 12.0,
     padding: int = 6,
 ) -> dict:
-    """
-    Detect a small white tape marker near the front of the red robot body.
-    """
+    """Detect a small white tape marker near the front of the red robot body."""
     cropped, offset_x, offset_y = _crop_with_padding(frame_bgr, body_bbox, padding)
     mask = _build_white_mask(cropped)
     contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -234,7 +221,6 @@ def detect_white_marker_near_body(
         center_y = float(moments["m01"] / moments["m00"])
         center = np.array([center_x, center_y], dtype=np.float32)
 
-        # Favor candidate markers that are farther from the robot center.
         distance_from_center = float(np.linalg.norm(center - body_center_local))
         score = distance_from_center + 0.1 * area
         if score > best_score:
@@ -256,14 +242,14 @@ def detect_white_marker_near_body(
         raise ValueError("White regions were found, but none looked like a usable tape marker.")
 
     return best
+
+
 def _corners_and_heading_from_front_pair(
     raw_corners: np.ndarray,
     center: np.ndarray,
     front_indices: list[int],
 ) -> tuple[dict, np.ndarray]:
-    """
-    Build ordered corners and heading once the two front corners are known.
-    """
+    """Build ordered corners and heading once the two front corners are known."""
     if len(front_indices) != 2:
         raise ValueError("front_indices must contain exactly two indices.")
 
@@ -284,8 +270,6 @@ def _corners_and_heading_from_front_pair(
         raise ValueError("Front edge midpoint overlaps the car center; heading is ambiguous.")
     forward = (forward / forward_mag).astype(np.float32)
 
-    # In image coordinates (x right, y down), the car's right side is a
-    # clockwise 90-degree rotation from the forward direction.
     right = np.array([-forward[1], forward[0]], dtype=np.float32)
 
     def split_lr(points_pair: tuple[np.ndarray, np.ndarray]):
@@ -307,30 +291,21 @@ def _corners_and_heading_from_front_pair(
     }
     return corners_dict, forward
 
+
 def _order_corners_and_heading_from_tape_center(
     raw_corners: np.ndarray,
     center: np.ndarray,
     tape_center: np.ndarray,
 ) -> tuple[dict, np.ndarray]:
-    """
-    Infer the front from the two corners closest to the detected tape center.
-
-    This matches the intended physical setup: place the tape on the front side,
-    then use the tape center to decide which two corners belong to that front.
-    """
+    """Infer the front from the two corners closest to the detected tape center."""
     corners = raw_corners.astype(np.float32).copy()
-    distances = [
-        float(np.linalg.norm(corner - tape_center))
-        for corner in corners
-    ]
+    distances = [float(np.linalg.norm(corner - tape_center)) for corner in corners]
     front_indices = sorted(range(4), key=lambda idx: distances[idx])[:2]
     return _corners_and_heading_from_front_pair(corners, center, front_indices)
 
 
 def detect_physical_car(frame_bgr: np.ndarray) -> dict:
-    """
-    Detect the physical square car in a stationary overhead webcam image.
-    """
+    """Detect the physical square car in a stationary overhead webcam image."""
     image_height, image_width = frame_bgr.shape[:2]
     body = detect_red_body(frame_bgr)
     front_marker = detect_white_marker_near_body(
@@ -346,8 +321,9 @@ def detect_physical_car(frame_bgr: np.ndarray) -> dict:
         marker_center,
     )
     heading_deg = _heading_from_vector(forward)
-    front_midpoint = (
-        0.5 * (np.array(car_corners["front_right"], dtype=np.float32) + np.array(car_corners["front_left"], dtype=np.float32))
+    front_midpoint = 0.5 * (
+        np.array(car_corners["front_right"], dtype=np.float32)
+        + np.array(car_corners["front_left"], dtype=np.float32)
     )
 
     state_array = np.array(
@@ -372,10 +348,7 @@ def detect_physical_car(frame_bgr: np.ndarray) -> dict:
             "right": float(image_width - 1),
             "bottom": float(image_height - 1),
         },
-        "image_size": {
-            "width": int(image_width),
-            "height": int(image_height),
-        },
+        "image_size": {"width": int(image_width), "height": int(image_height)},
         "car_center": (float(body["center"][0]), float(body["center"][1])),
         "car_corners": car_corners,
         "car_body_bbox": {
@@ -402,10 +375,135 @@ def detect_physical_car(frame_bgr: np.ndarray) -> dict:
     return result
 
 
+# ── Smoothing state ──────────────────────────────────────────────────────────
+
+class DetectionSmoother:
+    """
+    Applies exponential moving averages to heading and position so that
+    frame-to-frame noise doesn't propagate into jittery control commands.
+
+    Heading is smoothed in vector space (not angle space) so there is no
+    discontinuity at the 0°/360° boundary.  After blending, the vector is
+    re-normalised to stay on the unit circle.
+
+    A deadband on heading change means tiny sub-threshold perturbations are
+    simply discarded rather than integrated.
+    """
+
+    def __init__(
+        self,
+        heading_alpha: float = HEADING_ALPHA,
+        position_alpha: float = POSITION_ALPHA,
+        min_heading_change_deg: float = MIN_HEADING_CHANGE_DEG,
+    ):
+        self.heading_alpha = heading_alpha
+        self.position_alpha = position_alpha
+        self.min_heading_change_deg = min_heading_change_deg
+
+        self._smooth_forward: np.ndarray | None = None  # unit vector
+        self._smooth_center: np.ndarray | None = None   # (x, y) pixels
+
+    def reset(self):
+        self._smooth_forward = None
+        self._smooth_center = None
+
+    def update(self, detection: dict) -> dict:
+        """
+        Consume one raw detection dict and return a new dict whose
+        ``car_direction`` and ``car_center`` fields are smoothed.
+        The original dict is not mutated.
+        """
+        raw_forward = np.array(detection["car_direction"]["forward_vector"], dtype=np.float32)
+        raw_center = np.array(detection["car_center"], dtype=np.float32)
+
+        # ── Position EMA ────────────────────────────────────────────────────
+        if self._smooth_center is None:
+            self._smooth_center = raw_center.copy()
+        else:
+            self._smooth_center = (
+                self.position_alpha * raw_center
+                + (1.0 - self.position_alpha) * self._smooth_center
+            )
+
+        # ── Heading EMA with deadband ───────────────────────────────────────
+        if self._smooth_forward is None:
+            self._smooth_forward = raw_forward.copy()
+        else:
+            change_deg = _angle_between_vectors_deg(self._smooth_forward, raw_forward)
+            if change_deg >= self.min_heading_change_deg:
+                blended = (
+                    self.heading_alpha * raw_forward
+                    + (1.0 - self.heading_alpha) * self._smooth_forward
+                )
+                norm = float(np.linalg.norm(blended))
+                if norm > 1e-6:
+                    self._smooth_forward = (blended / norm).astype(np.float32)
+                # If norm collapses (180° flip), keep previous heading.
+
+        smooth_heading_deg = _heading_from_vector(self._smooth_forward)
+
+        # ── Rebuild corners from smoothed heading + smoothed center ─────────
+        # We keep the raw rotated-rect size/shape and only substitute the
+        # smoothed center and forward direction so corners stay consistent.
+        raw_corners = np.array(
+            [
+                detection["car_corners"]["front_right"],
+                detection["car_corners"]["front_left"],
+                detection["car_corners"]["back_left"],
+                detection["car_corners"]["back_right"],
+            ],
+            dtype=np.float32,
+        )
+        # Shift corners by the difference between raw and smooth center.
+        raw_center = np.array(detection["car_center"], dtype=np.float32)
+        center_delta = self._smooth_center - raw_center
+        shifted_corners = raw_corners + center_delta  # shape (4, 2)
+
+        smooth_front_right = tuple(shifted_corners[0].tolist())
+        smooth_front_left  = tuple(shifted_corners[1].tolist())
+        smooth_back_left   = tuple(shifted_corners[2].tolist())
+        smooth_back_right  = tuple(shifted_corners[3].tolist())
+
+        smooth_front_midpoint = 0.5 * (shifted_corners[0] + shifted_corners[1])
+
+        # ── Assemble smoothed result ────────────────────────────────────────
+        import copy
+        smoothed = copy.deepcopy(detection)
+        smoothed["car_center"] = (float(self._smooth_center[0]), float(self._smooth_center[1]))
+        smoothed["car_corners"] = {
+            "front_right": smooth_front_right,
+            "front_left":  smooth_front_left,
+            "back_right":  smooth_back_right,
+            "back_left":   smooth_back_left,
+        }
+        smoothed["car_direction"]["angle_degrees"] = smooth_heading_deg
+        smoothed["car_direction"]["forward_vector"] = (
+            float(self._smooth_forward[0]),
+            float(self._smooth_forward[1]),
+        )
+        smoothed["car_direction"]["front_midpoint"] = (
+            float(smooth_front_midpoint[0]),
+            float(smooth_front_midpoint[1]),
+        )
+
+        # Rebuild state array from smoothed values.
+        smoothed["state_array"] = np.array(
+            [
+                smooth_front_right[0], smooth_front_right[1],
+                smooth_front_left[0],  smooth_front_left[1],
+                smooth_back_right[0],  smooth_back_right[1],
+                smooth_back_left[0],   smooth_back_left[1],
+                smooth_heading_deg,
+            ],
+            dtype=np.float32,
+        )
+        return smoothed
+
+
+# ── Annotation ───────────────────────────────────────────────────────────────
+
 def annotate_detection(frame_bgr: np.ndarray, detection: dict) -> np.ndarray:
-    """
-    Draw the detected robot footprint and heading on top of a frame.
-    """
+    """Draw the detected robot footprint and heading on top of a frame."""
     output = frame_bgr.copy()
 
     corners = detection["car_corners"]
@@ -443,14 +541,7 @@ def annotate_detection(frame_bgr: np.ndarray, detection: dict) -> np.ndarray:
         cv2.circle(output, px, 4, (0, 200, 0), -1)
         text_x = px[0] + 6
         text_y = max(14, px[1] - 4)
-        _draw_text_box(
-            output,
-            label_map[name],
-            (text_x, text_y),
-            font_scale=0.38,
-            thickness=1,
-            padding=3,
-        )
+        _draw_text_box(output, label_map[name], (text_x, text_y), font_scale=0.38, thickness=1, padding=3)
 
     _draw_text_box(
         output,
@@ -460,7 +551,6 @@ def annotate_detection(frame_bgr: np.ndarray, detection: dict) -> np.ndarray:
         thickness=2,
         padding=6,
     )
-
     _draw_text_box(
         output,
         f"center=({int(detection['car_center'][0])}, {int(detection['car_center'][1])})",
@@ -473,17 +563,29 @@ def annotate_detection(frame_bgr: np.ndarray, detection: dict) -> np.ndarray:
     return output
 
 
+# ── Capture loop ─────────────────────────────────────────────────────────────
+
 def _capture_loop(
     camera_index: int,
     interval: float,
     frame_width: int,
     frame_height: int,
     display: bool,
+    heading_alpha: float,
+    position_alpha: float,
+    min_heading_change_deg: float,
 ):
     capture = _open_camera(camera_index)
     _configure_capture(capture, frame_width, frame_height)
     if not capture.isOpened():
         raise _camera_open_error(camera_index)
+
+    smoother = DetectionSmoother(
+        heading_alpha=heading_alpha,
+        position_alpha=position_alpha,
+        min_heading_change_deg=min_heading_change_deg,
+    )
+    last_good_detection: dict | None = None
 
     try:
         last_time = 0.0
@@ -491,22 +593,32 @@ def _capture_loop(
         while True:
             now = time.perf_counter()
             if now - last_time < interval:
-                if display:
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
+                if display and cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
                 continue
 
             ok, frame = capture.read()
             if not ok:
                 raise RuntimeError("Failed to read a frame from the webcam.")
 
-            detection = detect_physical_car(
-                frame,
-            )
-            print(json.dumps(_to_serializable(detection)))
+            try:
+                raw_detection = detect_physical_car(frame)
+                smoothed = smoother.update(raw_detection)
+                last_good_detection = smoothed
+            except ValueError:
+                # Detection failed this frame — reuse the last good result if
+                # available so downstream consumers see a stable value rather
+                # than a gap or an exception.
+                if last_good_detection is not None:
+                    smoothed = last_good_detection
+                else:
+                    last_time = now
+                    continue
+
+            print(json.dumps(_to_serializable(smoothed)))
 
             if display:
-                annotated = annotate_detection(frame, detection)
+                annotated = annotate_detection(frame, smoothed)
                 if not window_ready:
                     _prepare_preview_window(annotated)
                     window_ready = True
@@ -521,29 +633,53 @@ def _capture_loop(
             cv2.destroyAllWindows()
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(
         description="Detect a square red robot from an overhead webcam."
     )
-    parser.add_argument("--camera-index", type=int, default=0, help="Webcam index for OpenCV VideoCapture.")
-    parser.add_argument("--interval", type=float, default=1.0 / 15.0, help="Seconds between processed frames.")
-    parser.add_argument("--frame-width", type=int, default=DEFAULT_FRAME_WIDTH, help="Requested camera frame width.")
-    parser.add_argument("--frame-height", type=int, default=DEFAULT_FRAME_HEIGHT, help="Requested camera frame height.")
-    parser.add_argument("--input", default=None, help="Optional image path instead of live webcam input.")
+    parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--interval", type=float, default=1.0 / 15.0)
+    parser.add_argument("--frame-width", type=int, default=DEFAULT_FRAME_WIDTH)
+    parser.add_argument("--frame-height", type=int, default=DEFAULT_FRAME_HEIGHT)
+    parser.add_argument("--input", default=None, help="Optional image path instead of live webcam.")
+    parser.add_argument("--save-annotated", default=None)
+    parser.add_argument("--display", action="store_true")
+    # Smoothing knobs (can be tuned per-robot without touching the code)
     parser.add_argument(
-        "--save-annotated",
-        default=None,
-        help="Optional output path for the annotated image when using --input.",
+        "--heading-alpha",
+        type=float,
+        default=HEADING_ALPHA,
+        help="EMA weight for new heading samples [0..1]. Higher = more responsive.",
     )
-    parser.add_argument("--display", action="store_true", help="Show an annotated live preview window.")
+    parser.add_argument(
+        "--position-alpha",
+        type=float,
+        default=POSITION_ALPHA,
+        help="EMA weight for new position samples [0..1]. Higher = more responsive.",
+    )
+    parser.add_argument(
+        "--min-heading-change",
+        type=float,
+        default=MIN_HEADING_CHANGE_DEG,
+        help="Ignore heading changes smaller than this many degrees (deadband).",
+    )
     args = parser.parse_args()
+
+    smoother = DetectionSmoother(
+        heading_alpha=args.heading_alpha,
+        position_alpha=args.position_alpha,
+        min_heading_change_deg=args.min_heading_change,
+    )
 
     if args.input:
         frame = cv2.imread(args.input)
         if frame is None:
             raise RuntimeError(f"Could not read image: {args.input}")
         detection = detect_physical_car(frame)
-        annotated = annotate_detection(frame, detection)
+        smoothed = smoother.update(detection)  # seeds the filter; identical to raw on first frame
+        annotated = annotate_detection(frame, smoothed)
         if args.save_annotated:
             ok = cv2.imwrite(args.save_annotated, annotated)
             if not ok:
@@ -553,7 +689,7 @@ def main():
             cv2.imshow(WINDOW_NAME, annotated)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
-        print(json.dumps(_to_serializable(detection), indent=2))
+        print(json.dumps(_to_serializable(smoothed), indent=2))
         return
 
     _capture_loop(
@@ -562,6 +698,9 @@ def main():
         frame_width=args.frame_width,
         frame_height=args.frame_height,
         display=args.display,
+        heading_alpha=args.heading_alpha,
+        position_alpha=args.position_alpha,
+        min_heading_change_deg=args.min_heading_change,
     )
 
 
