@@ -44,13 +44,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "Target_Tracking"))
 sys.path.insert(0, os.path.join(HERE, "Bluetooth_Comms"))
 
-from car_detector import (  # noqa: E402
+from Target_Tracking.car_detector import (  # noqa: E402
     DetectionSmoother,
     _configure_capture,
     _open_camera,
     detect_physical_car,
 )
-from state_generator import (  # noqa: E402
+from Target_Tracking.state_generator import (  # noqa: E402
     DEBUG_WINDOW_NAME,
     MAP_HEIGHT,
     MAP_WIDTH,
@@ -61,8 +61,8 @@ from state_generator import (  # noqa: E402
     _resize_to_map,
     render_debug_view,
 )
-from target_detector import detect_target  # noqa: E402
-from remote_control import COMMANDS, PORT, send_command  # noqa: E402
+from Target_Tracking.target_detector import detect_target  # noqa: E402
+from Bluetooth_Comms.remote_control import COMMANDS, PORT, send_command  # noqa: E402
 
 from dqn_agent import DQNAgent  # noqa: E402
 

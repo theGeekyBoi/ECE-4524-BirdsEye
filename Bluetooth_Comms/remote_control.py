@@ -1,5 +1,6 @@
 import argparse
 import serial
+PORT = "COM3"
 
 COMMANDS = {
     "0": "255,1,255,1\n",  # Forward
@@ -20,7 +21,7 @@ def main():
     parser.add_argument(
         "--port",
         type=str,
-        default="COM8",
+        default="COM3",
         help="Serial port for the Bluetooth connection (default: COM8)",
     )
     args = parser.parse_args()
