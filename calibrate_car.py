@@ -57,6 +57,7 @@ sys.path.insert(0, os.path.join(HERE, "Target_Tracking"))
 sys.path.insert(0, os.path.join(HERE, "Bluetooth_Comms"))
 
 from Target_Tracking.car_detector import (  # noqa: E402
+    DetectionSmoother,
     _configure_capture,
     _open_camera,
     annotate_detection,
@@ -69,6 +70,17 @@ import TestRig  # noqa: E402  (only used to read sim constants for the report)
 
 
 GUI_WINDOW_NAME = "calibrate_car (GUI)"
+# Smoother warmup counts. The smoother in car_detector.py uses an EMA on
+# unit-vector forward + a 4-degree deadband, so it needs several consecutive
+# raw updates to converge after a heading change. We warm it up explicitly
+# right before each t0/t1 read so the smoothed forward we measure with is
+# representative of the current direction, not of a stale earlier one.
+SMOOTHER_PRE_MOTION_WARMUP_FRAMES = 12
+SMOOTHER_POST_MOTION_WARMUP_FRAMES = 18
+# In headless motion mode (no GUI live feed) we still need to feed the smoother
+# during the action's hold time, otherwise its center-jump rejection
+# (max_center_jump_px = 150) can throw out the post-motion frame entirely.
+HEADLESS_MOTION_FEED_INTERVAL_S = 0.05
 # Most USB webcams buffer several frames internally. cv2.VideoCapture.read()
 # returns the OLDEST queued frame, so without draining we routinely measure
 # pre-motion frames at "t1" and silently report zero displacement even though
@@ -246,6 +258,70 @@ def _detect_raw_with_frame(capture) -> tuple[dict, dict, np.ndarray]:
     return det, body, frame
 
 
+def _detect_with_smoother(
+    capture,
+    smoother: DetectionSmoother,
+) -> tuple[dict, dict, dict, np.ndarray]:
+    """Drain, grab, run raw detection, push it through the smoother.
+
+    Returns (raw_det, smoothed_det, body, frame). Use this at MEASUREMENT
+    points (t0 / t1 reads, warmup loop) where you want the freshest possible
+    frame. For continuous in-motion feeding use _detect_with_smoother_nodrain
+    instead, which avoids burning ~10 frames per call.
+    """
+    frame = _grab_fresh_resized_frame(capture)
+    raw_det, body = detect_physical_car(frame)
+    smoothed_det = smoother.update(raw_det)
+    return raw_det, smoothed_det, body, frame
+
+
+def _detect_with_smoother_nodrain(
+    capture,
+    smoother: DetectionSmoother,
+) -> tuple[dict, dict, dict, np.ndarray]:
+    """Same as _detect_with_smoother but does NOT drain the camera buffer.
+
+    Used for in-motion smoother feeding where the priority is "keep the
+    EMA updated at ~20 Hz" rather than "freshest possible frame." Draining
+    every iteration would burn ~10 frames per call and could block on cameras
+    that don't honor CAP_PROP_BUFFERSIZE=1.
+    """
+    frame = _grab_resized_frame(capture)
+    raw_det, body = detect_physical_car(frame)
+    smoothed_det = smoother.update(raw_det)
+    return raw_det, smoothed_det, body, frame
+
+
+def _warm_smoother(
+    capture,
+    smoother: DetectionSmoother,
+    n_frames: int,
+) -> int:
+    """Feed n_frames consecutive fresh detections into the smoother.
+
+    Returns the number of successful updates. Detection failures are logged
+    once but otherwise tolerated. The smoother's EMA + 4-degree deadband
+    needs ~6-10 updates to converge to a new heading after a large jump
+    (e.g. post-rotation), so we warm it up explicitly before each measurement.
+    """
+    successes = 0
+    failures = 0
+    for _ in range(max(0, n_frames)):
+        try:
+            frame = _grab_fresh_resized_frame(capture)
+            raw_det, _body = detect_physical_car(frame)
+            smoother.update(raw_det)
+            successes += 1
+        except (RuntimeError, ValueError):
+            failures += 1
+    if failures:
+        print(
+            f"    [smoother warmup] {failures}/{n_frames} frame(s) failed "
+            f"detection; smoother used remaining {successes} sample(s)."
+        )
+    return successes
+
+
 def _send(ser, action: str, no_serial: bool) -> None:
     if action not in COMMANDS:
         raise ValueError(f"Unknown action id: {action}")
@@ -255,7 +331,12 @@ def _send(ser, action: str, no_serial: bool) -> None:
     send_command(ser, action)
 
 
-def _countdown(seconds: float, capture=None, gui: bool = False) -> None:
+def _countdown(
+    seconds: float,
+    capture=None,
+    gui: bool = False,
+    smoother: DetectionSmoother | None = None,
+) -> None:
     if seconds <= 0:
         return
     remaining = int(math.ceil(seconds))
@@ -267,6 +348,7 @@ def _countdown(seconds: float, capture=None, gui: bool = False) -> None:
                     capture,
                     1.0,
                     [f"COUNTDOWN: next phase in {remaining}s"],
+                    smoother=smoother,
                 )
             except QuitRequested:
                 raise
@@ -316,11 +398,45 @@ def _draw_hud_lines(view: np.ndarray, lines: list[str], origin=(12, 80)) -> None
         y += 22
 
 
-def _annotate_or_failed(frame: np.ndarray) -> np.ndarray:
-    """Try to detect and annotate; on failure return frame with a FAILED HUD."""
+def _draw_smoothed_arrow(
+    view: np.ndarray,
+    raw_det: dict,
+    smoothed_det: dict,
+    color: tuple[int, int, int] = (0, 255, 255),
+) -> None:
+    """Draw the smoother's forward direction as an extra arrow on top of an
+    already-annotated view. Color defaults to yellow (BGR (0,255,255)).
+
+    The arrow is anchored at the raw car center (so you can compare it
+    visually to the blue raw arrow that annotate_detection draws), and uses
+    the smoothed forward_vector for its direction. Length matches the raw
+    front-midpoint distance for visual parity.
+    """
+    cx, cy = raw_det["car_center"]
+    fmx, fmy = raw_det["car_direction"]["front_midpoint"]
+    arrow_len = float(np.hypot(fmx - cx, fmy - cy))
+    if arrow_len < 1.0:
+        arrow_len = 60.0
+    sf = smoothed_det["car_direction"]["forward_vector"]
+    end = (
+        int(round(cx + sf[0] * arrow_len)),
+        int(round(cy + sf[1] * arrow_len)),
+    )
+    start = (int(round(cx)), int(round(cy)))
+    cv2.arrowedLine(view, start, end, color, 3, tipLength=0.25)
+
+
+def _annotate_or_failed(
+    frame: np.ndarray,
+    smoother: DetectionSmoother | None = None,
+) -> np.ndarray:
+    """Try to detect and annotate; on failure return frame with a FAILED HUD.
+
+    If smoother is provided, also feed it the raw detection AND draw the
+    smoothed forward direction as a yellow arrow on top of the annotation.
+    """
     try:
-        det, body = detect_physical_car(frame)
-        return annotate_detection(frame, det, body)
+        raw_det, body = detect_physical_car(frame)
     except (RuntimeError, ValueError) as exc:
         view = frame.copy()
         cv2.putText(
@@ -333,13 +449,25 @@ def _annotate_or_failed(frame: np.ndarray) -> np.ndarray:
         )
         return view
 
+    view = annotate_detection(frame, raw_det, body)
+    if smoother is not None:
+        smoothed_det = smoother.update(raw_det)
+        _draw_smoothed_arrow(view, raw_det, smoothed_det)
+    return view
+
 
 def _gui_show_live(
     capture,
     duration_s: float,
     hud_lines: list[str],
+    smoother: DetectionSmoother | None = None,
 ) -> None:
-    """Run a live annotated feed for duration_s seconds. Raises QuitRequested on 'q'."""
+    """Run a live annotated feed for duration_s seconds. Raises QuitRequested on 'q'.
+
+    If smoother is provided, every frame is also pushed through the smoother
+    (so its EMA can converge naturally during the live feed) and the smoothed
+    forward direction is drawn as a yellow arrow on top of the raw annotation.
+    """
     end_t = time.perf_counter() + max(0.0, duration_s)
     while time.perf_counter() < end_t:
         try:
@@ -348,7 +476,7 @@ def _gui_show_live(
             if (cv2.waitKey(15) & 0xFF) == ord("q"):
                 raise QuitRequested()
             continue
-        view = _annotate_or_failed(frame)
+        view = _annotate_or_failed(frame, smoother=smoother)
         _draw_hud_lines(view, hud_lines)
         cv2.imshow(GUI_WINDOW_NAME, view)
         if (cv2.waitKey(15) & 0xFF) == ord("q"):
@@ -372,12 +500,16 @@ def _build_comparison_view(
     det_t1: dict,
     body_t1: dict,
     hud_lines: list[str],
+    smoothed_forward_t0: np.ndarray | None = None,
+    smoothed_forward_t1: np.ndarray | None = None,
 ) -> np.ndarray:
     """Render a single 900x600 view with both t0 (cyan) and t1 (yellow) overlays
     on top of the t1 frame, plus a magenta arrow for the center displacement.
 
-    This is the "did the car actually move?" frame the user can stare at to
-    diagnose stale-buffer or detector-lock issues.
+    If smoothed_forward_t0 / smoothed_forward_t1 are provided, the smoothed
+    direction at each time is drawn as a thicker yellow arrow on top of the
+    raw arrows, so the user can see exactly which forward vector the speed
+    measurement is using.
     """
     view = annotate_detection(frame_t1, det_t1, body_t1)
 
@@ -390,11 +522,38 @@ def _build_comparison_view(
     )
     cv2.polylines(view, [poly0], isClosed=True, color=(255, 255, 0), thickness=2)
 
-    # t0 heading arrow in cyan.
+    # t0 RAW heading arrow in cyan.
     ctr0 = tuple(map(int, det_t0["car_center"]))
     tip0 = tuple(map(int, det_t0["car_direction"]["front_midpoint"]))
     cv2.circle(view, ctr0, 4, (255, 255, 0), -1)
     cv2.arrowedLine(view, ctr0, tip0, (255, 255, 0), 2, tipLength=0.25)
+
+    # t0 SMOOTHED heading arrow in yellow (the direction we measure with).
+    if smoothed_forward_t0 is not None:
+        cx0, cy0 = det_t0["car_center"]
+        fmx0, fmy0 = det_t0["car_direction"]["front_midpoint"]
+        arrow_len_0 = max(60.0, float(np.hypot(fmx0 - cx0, fmy0 - cy0)))
+        end0 = (
+            int(round(cx0 + smoothed_forward_t0[0] * arrow_len_0)),
+            int(round(cy0 + smoothed_forward_t0[1] * arrow_len_0)),
+        )
+        cv2.arrowedLine(view, ctr0, end0, (0, 255, 255), 3, tipLength=0.25)
+
+    # t1 SMOOTHED heading arrow in yellow.
+    if smoothed_forward_t1 is not None:
+        cx1, cy1 = det_t1["car_center"]
+        fmx1, fmy1 = det_t1["car_direction"]["front_midpoint"]
+        arrow_len_1 = max(60.0, float(np.hypot(fmx1 - cx1, fmy1 - cy1)))
+        end1 = (
+            int(round(cx1 + smoothed_forward_t1[0] * arrow_len_1)),
+            int(round(cy1 + smoothed_forward_t1[1] * arrow_len_1)),
+        )
+        cv2.arrowedLine(
+            view,
+            (int(round(cx1)), int(round(cy1))),
+            end1,
+            (0, 255, 255), 3, tipLength=0.25,
+        )
 
     # Magenta center-to-center displacement arrow.
     ctr1 = tuple(map(int, det_t1["car_center"]))
@@ -402,8 +561,9 @@ def _build_comparison_view(
 
     # Legend.
     legend = [
-        "cyan polygon/arrow = t0 (pre-motion)",
-        "green polygon + blue arrow = t1 (post-motion)",
+        "cyan polygon + cyan arrow = t0 (pre-motion, raw)",
+        "green polygon + blue arrow = t1 (post-motion, raw)",
+        "yellow arrow = SMOOTHED forward (used for measurements)",
         "magenta arrow = center displacement",
     ]
     _draw_hud_lines(view, legend + [""] + hud_lines, origin=(12, 100))
@@ -503,7 +663,12 @@ def _summarize(values: list[float]) -> dict:
 # ----------------------------------------------------------------------------
 
 
-def measure_footprint(capture, num_frames: int, gui: bool) -> dict:
+def measure_footprint(
+    capture,
+    num_frames: int,
+    gui: bool,
+    smoother: DetectionSmoother,
+) -> dict:
     print(f"\n=== Phase 1: Footprint ({num_frames} frames, raw detector) ===")
     print("  Hold the car still. Sampling now ...")
 
@@ -513,7 +678,9 @@ def measure_footprint(capture, num_frames: int, gui: bool) -> dict:
 
     for i in range(num_frames):
         try:
-            det, body, frame = _detect_raw_with_frame(capture)
+            raw_det, smoothed_det, body, frame = _detect_with_smoother(
+                capture, smoother
+            )
         except (RuntimeError, ValueError) as exc:
             failures += 1
             print(f"  [frame {i + 1}/{num_frames}] detection failed: {exc}")
@@ -533,18 +700,20 @@ def measure_footprint(capture, num_frames: int, gui: bool) -> dict:
                 except RuntimeError:
                     pass
             continue
-        length_px, width_px = _footprint_dims(det)
+        length_px, width_px = _footprint_dims(raw_det)
         lengths.append(length_px)
         widths.append(width_px)
 
         if gui:
-            view = annotate_detection(frame, det, body)
+            view = annotate_detection(frame, raw_det, body)
+            _draw_smoothed_arrow(view, raw_det, smoothed_det)
             _draw_hud_lines(
                 view,
                 [
                     f"PHASE 1: Footprint ({i + 1}/{num_frames})",
                     f"length_px = {length_px:6.2f}",
                     f"width_px  = {width_px:6.2f}",
+                    "Yellow arrow = smoothed forward (measurements use this)",
                     "Hold the car still.",
                 ],
             )
@@ -568,6 +737,7 @@ def _run_motion_trial(
     capture,
     ser,
     no_serial: bool,
+    smoother: DetectionSmoother,
     action: str,
     motion_duration: float,
     settle_duration: float,
@@ -579,13 +749,24 @@ def _run_motion_trial(
 ) -> dict | None:
     """Run a single motion trial. Returns per-trial measurements or None on failure.
 
-    In GUI mode also: shows the t0 snapshot frozen for gui_freeze seconds, runs
-    a live annotated feed during motion + settle (so the user can visually
-    confirm the car actually moves), and finally shows a t0/t1 comparison
-    overlay with the displacement vector.
+    Direction (forward_vector) at both t0 and t1 comes from the SMOOTHER, not
+    from a single raw detection, so frame-to-frame white-tape jitter cannot
+    poison the heading. The smoother is warmed up immediately before each
+    capture point and continuously fed during the motion + settle window, so
+    its EMA actually has time to converge.
+
+    Center stays raw (the centroid of the big red blob is stable enough on
+    its own). Footprint corners are unchanged elsewhere.
     """
+    # ---- Pre-motion warmup --------------------------------------------------
+    # Bring the smoother's forward in line with the car's CURRENT pre-motion
+    # direction (it may have lagged from the previous trial / phase).
+    _warm_smoother(capture, smoother, SMOOTHER_PRE_MOTION_WARMUP_FRAMES)
+
     try:
-        det0, body0, frame0 = _detect_raw_with_frame(capture)
+        raw_det0, smoothed_det0, body0, frame0 = _detect_with_smoother(
+            capture, smoother
+        )
     except (RuntimeError, ValueError) as exc:
         print(f"    pre-motion detection failed: {exc}")
         # Best-effort stop in case the previous trial left the motors live.
@@ -595,88 +776,137 @@ def _run_motion_trial(
             pass
         return None
 
-    center_t0 = np.asarray(det0["car_center"], dtype=np.float64)
-    forward_t0 = np.asarray(det0["car_direction"]["forward_vector"], dtype=np.float64)
+    center_t0 = np.asarray(raw_det0["car_center"], dtype=np.float64)
+    raw_forward_t0 = np.asarray(
+        raw_det0["car_direction"]["forward_vector"], dtype=np.float64
+    )
+    forward_t0 = np.asarray(
+        smoothed_det0["car_direction"]["forward_vector"], dtype=np.float64
+    )
 
     if gui:
-        view = annotate_detection(frame0, det0, body0)
+        view = annotate_detection(frame0, raw_det0, body0)
+        _draw_smoothed_arrow(view, raw_det0, smoothed_det0)
         _draw_hud_lines(
             view,
             [
                 f"{phase_label}  trial {trial_idx}/{trial_total}",
                 "T0 (pre-motion) - about to send command",
                 f"action {action} -> '{COMMANDS[action].strip()}'",
-                f"center_t0 = ({center_t0[0]:6.1f}, {center_t0[1]:6.1f})",
-                f"forward_t0 = ({forward_t0[0]:+.3f}, {forward_t0[1]:+.3f})",
+                f"center_t0      = ({center_t0[0]:6.1f}, {center_t0[1]:6.1f})",
+                f"raw_forward_t0 = ({raw_forward_t0[0]:+.3f}, {raw_forward_t0[1]:+.3f})",
+                f"smo_forward_t0 = ({forward_t0[0]:+.3f}, {forward_t0[1]:+.3f})",
             ],
         )
         _gui_freeze(view, gui_freeze)
 
-    # Drive.
+    # ---- Drive --------------------------------------------------------------
     t_start = time.perf_counter()
     _send(ser, action, no_serial)
 
     if gui:
-        # Live annotated feed while the car is supposed to be moving. This is
-        # the key diagnostic frame: if the car physically moves but the green
-        # polygon doesn't track, the detector is locked onto the wrong thing.
+        # Live annotated feed while the car is supposed to be moving. The
+        # smoother is fed every frame so its EMA tracks the rotation/translation.
         live_hud = [
             f"{phase_label}  trial {trial_idx}/{trial_total}",
             "MOVING - command in flight",
             f"action {action}",
         ]
         try:
-            _gui_show_live(capture, motion_duration, live_hud)
+            _gui_show_live(capture, motion_duration, live_hud, smoother=smoother)
         except QuitRequested:
             _send(ser, "4", no_serial)
             raise
     else:
+        # Headless: sleep loop, but periodically detect+update the smoother so
+        # it actually sees the rotation in flight (otherwise the post-motion
+        # frame would be a single 100+ degree jump that the smoother's EMA
+        # would only partially absorb in one update).
+        last_feed = 0.0
         while time.perf_counter() - t_start < motion_duration:
-            # Tight sleep loop - keep the action held for as close to
-            # motion_duration as possible without busy-waiting.
-            time.sleep(0.005)
+            now = time.perf_counter()
+            if now - last_feed >= HEADLESS_MOTION_FEED_INTERVAL_S:
+                try:
+                    _detect_with_smoother_nodrain(capture, smoother)
+                except (RuntimeError, ValueError):
+                    # Detection mid-motion can occasionally fail (motion blur,
+                    # tape partially occluded by hand, etc). Keep going.
+                    pass
+                last_feed = now
+            else:
+                time.sleep(0.005)
 
     _send(ser, "4", no_serial)
     elapsed = time.perf_counter() - t_start
 
-    # Let the car actually halt before we measure.
+    # ---- Settle -------------------------------------------------------------
     if gui:
         try:
             _gui_show_live(
                 capture,
                 settle_duration,
                 [f"{phase_label}  trial {trial_idx}/{trial_total}", "SETTLING ..."],
+                smoother=smoother,
             )
         except QuitRequested:
             raise
     else:
-        time.sleep(settle_duration)
+        # Keep feeding the smoother during settle too.
+        settle_end = time.perf_counter() + settle_duration
+        last_feed = 0.0
+        while time.perf_counter() < settle_end:
+            now = time.perf_counter()
+            if now - last_feed >= HEADLESS_MOTION_FEED_INTERVAL_S:
+                try:
+                    _detect_with_smoother_nodrain(capture, smoother)
+                except (RuntimeError, ValueError):
+                    pass
+                last_feed = now
+            else:
+                time.sleep(0.005)
+
+    # ---- Post-motion warmup -------------------------------------------------
+    # Push the smoother the rest of the way to the post-motion direction.
+    _warm_smoother(capture, smoother, SMOOTHER_POST_MOTION_WARMUP_FRAMES)
 
     try:
-        det1, body1, frame1 = _detect_raw_with_frame(capture)
+        raw_det1, smoothed_det1, body1, frame1 = _detect_with_smoother(
+            capture, smoother
+        )
     except (RuntimeError, ValueError) as exc:
         print(f"    post-motion detection failed: {exc}")
         return None
 
-    center_t1 = np.asarray(det1["car_center"], dtype=np.float64)
-    forward_t1 = np.asarray(det1["car_direction"]["forward_vector"], dtype=np.float64)
+    center_t1 = np.asarray(raw_det1["car_center"], dtype=np.float64)
+    raw_forward_t1 = np.asarray(
+        raw_det1["car_direction"]["forward_vector"], dtype=np.float64
+    )
+    forward_t1 = np.asarray(
+        smoothed_det1["car_direction"]["forward_vector"], dtype=np.float64
+    )
 
     signed_fwd_px, total_disp_px = _signed_forward_displacement(
         center_t0, forward_t0, center_t1
     )
     heading_delta_deg = _signed_heading_delta_deg(forward_t0, forward_t1)
+    raw_heading_delta_deg = _signed_heading_delta_deg(raw_forward_t0, raw_forward_t1)
 
     if gui:
         comparison_hud = [
             f"{phase_label}  trial {trial_idx}/{trial_total}  (T1)",
-            f"elapsed       = {elapsed:.3f}s",
-            f"center_t1     = ({center_t1[0]:6.1f}, {center_t1[1]:6.1f})",
-            f"|disp|        = {total_disp_px:6.2f} px",
-            f"signed_fwd    = {signed_fwd_px:+6.2f} px",
-            f"d_heading     = {heading_delta_deg:+6.2f} deg",
+            f"elapsed             = {elapsed:.3f}s",
+            f"center_t1           = ({center_t1[0]:6.1f}, {center_t1[1]:6.1f})",
+            f"|disp|              = {total_disp_px:6.2f} px",
+            f"signed_fwd          = {signed_fwd_px:+6.2f} px",
+            f"d_heading (smoothed)= {heading_delta_deg:+6.2f} deg",
+            f"d_heading (raw)     = {raw_heading_delta_deg:+6.2f} deg",
         ]
         view = _build_comparison_view(
-            frame0, det0, body0, frame1, det1, body1, comparison_hud
+            frame0, raw_det0, body0,
+            frame1, raw_det1, body1,
+            comparison_hud,
+            smoothed_forward_t0=forward_t0,
+            smoothed_forward_t1=forward_t1,
         )
         _gui_freeze(view, gui_freeze)
 
@@ -685,6 +915,7 @@ def _run_motion_trial(
         "signed_fwd_px": signed_fwd_px,
         "total_disp_px": total_disp_px,
         "heading_delta_deg": heading_delta_deg,
+        "raw_heading_delta_deg": raw_heading_delta_deg,
     }
 
 
@@ -692,6 +923,7 @@ def measure_linear(
     capture,
     ser,
     no_serial: bool,
+    smoother: DetectionSmoother,
     action: str,
     label: str,
     trials: int,
@@ -710,6 +942,7 @@ def measure_linear(
             capture,
             ser,
             no_serial,
+            smoother,
             action,
             motion_duration,
             settle_duration,
@@ -742,6 +975,7 @@ def measure_angular(
     capture,
     ser,
     no_serial: bool,
+    smoother: DetectionSmoother,
     action: str,
     label: str,
     trials: int,
@@ -752,6 +986,7 @@ def measure_angular(
 ) -> dict:
     print(f"\n=== Phase: {label} (action {action}, trials={trials}) ===")
     rates: list[float] = []
+    raw_rates: list[float] = []
     drifts: list[float] = []
     failures = 0
 
@@ -761,6 +996,7 @@ def measure_angular(
             capture,
             ser,
             no_serial,
+            smoother,
             action,
             motion_duration,
             settle_duration,
@@ -775,17 +1011,21 @@ def measure_angular(
             continue
 
         rate_deg_s = result["heading_delta_deg"] / result["elapsed"]
+        raw_rate_deg_s = result["raw_heading_delta_deg"] / result["elapsed"]
         rates.append(rate_deg_s)
+        raw_rates.append(raw_rate_deg_s)
         drifts.append(result["total_disp_px"])
         print(
             f"    elapsed={result['elapsed']:.3f}s  "
-            f"d_heading={result['heading_delta_deg']:+7.2f}deg  "
+            f"d_heading(smoothed)={result['heading_delta_deg']:+7.2f}deg  "
+            f"d_heading(raw)={result['raw_heading_delta_deg']:+7.2f}deg  "
             f"drift={result['total_disp_px']:6.2f}px  "
-            f"=> {rate_deg_s:+7.2f} deg/s"
+            f"=> {rate_deg_s:+7.2f} deg/s (smoothed)"
         )
 
     return {
         "rate_deg_s": _summarize(rates),
+        "raw_rate_deg_s": _summarize(raw_rates),
         "drift_px": _summarize(drifts),
         "failures": failures,
     }
@@ -853,14 +1093,22 @@ def print_report(
         f"trials={args.trials}) ==="
     )
     print("  action 2 (rotate left / CCW) :")
-    print(_fmt_summary(ccw["rate_deg_s"], "deg/s"))
+    print("    smoothed:", _fmt_summary(ccw["rate_deg_s"], "deg/s").strip())
+    print("    raw     :", _fmt_summary(ccw["raw_rate_deg_s"], "deg/s").strip())
     if ccw["failures"]:
         print(f"    ({ccw['failures']} trial(s) failed)")
     print("  action 3 (rotate right / CW) :")
-    print(_fmt_summary(cw["rate_deg_s"], "deg/s"))
+    print("    smoothed:", _fmt_summary(cw["rate_deg_s"], "deg/s").strip())
+    print("    raw     :", _fmt_summary(cw["raw_rate_deg_s"], "deg/s").strip())
     if cw["failures"]:
         print(f"    ({cw['failures']} trial(s) failed)")
-    print(f"  (sim CAR_ROT_SPEED = {SIM_CAR_ROT_SPEED} deg/s; sign convention: + = CCW)")
+    print(
+        f"  (sim CAR_ROT_SPEED = {SIM_CAR_ROT_SPEED} deg/s; sign convention: + = CCW)"
+    )
+    print(
+        "  ('smoothed' uses DetectionSmoother forward; 'raw' uses one-shot "
+        "tape-based forward. Big disagreement = noisy white tape; trust smoothed.)"
+    )
 
     print("\n  drift during rotation (total displacement, |delta_center|):")
     print(f"    action 2 (CCW): {_fmt_summary(ccw['drift_px'], 'px').strip()}")
@@ -908,14 +1156,22 @@ def run(args: argparse.Namespace) -> None:
             "that window at any time to quit early."
         )
 
+    # One persistent smoother across the whole run. Direction at every t0/t1
+    # measurement read uses smoother.update(...) output; the smoother is fed
+    # continuously (footprint loop, GUI live feed, headless motion drain) so
+    # its EMA actually has time to converge.
+    smoother = DetectionSmoother()
+
     footprint = forward = backward = ccw = cw = None
     quit_early = False
     try:
-        footprint = measure_footprint(capture, args.footprint_frames, gui=args.gui)
+        footprint = measure_footprint(
+            capture, args.footprint_frames, gui=args.gui, smoother=smoother
+        )
 
-        _countdown(args.countdown, capture=capture, gui=args.gui)
+        _countdown(args.countdown, capture=capture, gui=args.gui, smoother=smoother)
         forward = measure_linear(
-            capture, ser, args.no_serial,
+            capture, ser, args.no_serial, smoother,
             action="0", label="Forward speed",
             trials=args.trials,
             motion_duration=args.motion_duration,
@@ -923,9 +1179,9 @@ def run(args: argparse.Namespace) -> None:
             gui=args.gui, gui_freeze=args.gui_freeze,
         )
 
-        _countdown(args.countdown, capture=capture, gui=args.gui)
+        _countdown(args.countdown, capture=capture, gui=args.gui, smoother=smoother)
         backward = measure_linear(
-            capture, ser, args.no_serial,
+            capture, ser, args.no_serial, smoother,
             action="1", label="Backward speed",
             trials=args.trials,
             motion_duration=args.motion_duration,
@@ -933,9 +1189,9 @@ def run(args: argparse.Namespace) -> None:
             gui=args.gui, gui_freeze=args.gui_freeze,
         )
 
-        _countdown(args.countdown, capture=capture, gui=args.gui)
+        _countdown(args.countdown, capture=capture, gui=args.gui, smoother=smoother)
         ccw = measure_angular(
-            capture, ser, args.no_serial,
+            capture, ser, args.no_serial, smoother,
             action="2", label="Rotate left (CCW)",
             trials=args.trials,
             motion_duration=args.motion_duration,
@@ -943,9 +1199,9 @@ def run(args: argparse.Namespace) -> None:
             gui=args.gui, gui_freeze=args.gui_freeze,
         )
 
-        _countdown(args.countdown, capture=capture, gui=args.gui)
+        _countdown(args.countdown, capture=capture, gui=args.gui, smoother=smoother)
         cw = measure_angular(
-            capture, ser, args.no_serial,
+            capture, ser, args.no_serial, smoother,
             action="3", label="Rotate right (CW)",
             trials=args.trials,
             motion_duration=args.motion_duration,
