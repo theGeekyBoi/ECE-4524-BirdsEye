@@ -3,8 +3,8 @@ import serial
 PORT = "COM3"
 
 COMMANDS = {
-    "0": "120,1,120,1\n",  # Forward slow
-    "1": "120,0,120,0\n",  # Backward slow
+    "0": "160,1,160,1\n",  # Forward slow
+    "1": "160,0,160,0\n",  # Backward slow
     "2": "200,0,200,1\n",  # Rotate left slow
     "3": "200,1,200,0\n",  # Rotate right slow
     "4": "0,1,0,1\n",      # Stop
