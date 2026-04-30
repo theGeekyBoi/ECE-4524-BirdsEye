@@ -17,7 +17,9 @@ sees at runtime:
     Phase 5 - CW rotation speed (action 3)
 
 For each motion phase: snapshot car pose, send the action via the existing
-Bluetooth serial path, sleep --motion-duration seconds, send action 4 (stop),
+Bluetooth serial path, sleep for the phase's motion duration
+(--linear-motion-duration for forward/backward, --angular-motion-duration
+for CCW/CW; or --motion-duration to set both at once), send action 4 (stop),
 let the car settle, snapshot again, derive linear speed (px/s, signed onto
 the pre-motion forward axis) or angular speed (deg/s, atan2 of cross/dot on
 forward unit vectors so 0/360 wrap-around does not poison the result).
@@ -38,6 +40,7 @@ Usage:
     python calibrate_car.py --gui                  # adds visualization window
     python calibrate_car.py --no-serial            # perception path only
     python calibrate_car.py --motion-duration 1.5 --trials 5
+    python calibrate_car.py --linear-motion-duration 0.3 --angular-motion-duration 1.2
 """
 
 from __future__ import annotations
@@ -135,10 +138,34 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--motion-duration",
+        "--linear-motion-duration",
+        type=float,
+        default=0.5,
+        help=(
+            "Seconds to hold the action during each forward/backward trial "
+            "(default: 0.5). Shorter than the angular duration so the car "
+            "does not run out of room on the table."
+        ),
+    )
+    parser.add_argument(
+        "--angular-motion-duration",
         type=float,
         default=1.0,
-        help="Seconds to hold the action during each motion trial (default: 1.0).",
+        help=(
+            "Seconds to hold the action during each CCW/CW rotation trial "
+            "(default: 1.0). Kept full-length so the swept arc is large "
+            "enough for a clean deg/s estimate."
+        ),
+    )
+    parser.add_argument(
+        "--motion-duration",
+        type=float,
+        default=None,
+        help=(
+            "Backward-compat shortcut: if provided, overrides BOTH "
+            "--linear-motion-duration and --angular-motion-duration with "
+            "this single value."
+        ),
     )
     parser.add_argument(
         "--settle-duration",
@@ -1075,7 +1102,7 @@ def print_report(
         print(f"  ({footprint['failures']} frame(s) failed detection)")
 
     print(
-        f"\n=== Linear speed (motion_duration={args.motion_duration}s, "
+        f"\n=== Linear speed (motion_duration={args.linear_motion_duration}s, "
         f"trials={args.trials}) ==="
     )
     print("  action 0 (forward) :")
@@ -1089,7 +1116,7 @@ def print_report(
     print(f"  (sim CAR_SPEED = {SIM_CAR_SPEED} px/s)")
 
     print(
-        f"\n=== Angular speed (motion_duration={args.motion_duration}s, "
+        f"\n=== Angular speed (motion_duration={args.angular_motion_duration}s, "
         f"trials={args.trials}) ==="
     )
     print("  action 2 (rotate left / CCW) :")
@@ -1156,6 +1183,17 @@ def run(args: argparse.Namespace) -> None:
             "that window at any time to quit early."
         )
 
+    # If the user passed the legacy --motion-duration override, it wins for
+    # both linear and angular phases; otherwise each phase uses its own flag.
+    if args.motion_duration is not None:
+        linear_dur = args.motion_duration
+        angular_dur = args.motion_duration
+    else:
+        linear_dur = args.linear_motion_duration
+        angular_dur = args.angular_motion_duration
+    args.linear_motion_duration = linear_dur
+    args.angular_motion_duration = angular_dur
+
     # One persistent smoother across the whole run. Direction at every t0/t1
     # measurement read uses smoother.update(...) output; the smoother is fed
     # continuously (footprint loop, GUI live feed, headless motion drain) so
@@ -1174,7 +1212,7 @@ def run(args: argparse.Namespace) -> None:
             capture, ser, args.no_serial, smoother,
             action="0", label="Forward speed",
             trials=args.trials,
-            motion_duration=args.motion_duration,
+            motion_duration=linear_dur,
             settle_duration=args.settle_duration,
             gui=args.gui, gui_freeze=args.gui_freeze,
         )
@@ -1184,7 +1222,7 @@ def run(args: argparse.Namespace) -> None:
             capture, ser, args.no_serial, smoother,
             action="1", label="Backward speed",
             trials=args.trials,
-            motion_duration=args.motion_duration,
+            motion_duration=linear_dur,
             settle_duration=args.settle_duration,
             gui=args.gui, gui_freeze=args.gui_freeze,
         )
@@ -1194,7 +1232,7 @@ def run(args: argparse.Namespace) -> None:
             capture, ser, args.no_serial, smoother,
             action="2", label="Rotate left (CCW)",
             trials=args.trials,
-            motion_duration=args.motion_duration,
+            motion_duration=angular_dur,
             settle_duration=args.settle_duration,
             gui=args.gui, gui_freeze=args.gui_freeze,
         )
@@ -1204,7 +1242,7 @@ def run(args: argparse.Namespace) -> None:
             capture, ser, args.no_serial, smoother,
             action="3", label="Rotate right (CW)",
             trials=args.trials,
-            motion_duration=args.motion_duration,
+            motion_duration=angular_dur,
             settle_duration=args.settle_duration,
             gui=args.gui, gui_freeze=args.gui_freeze,
         )

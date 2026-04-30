@@ -10,6 +10,8 @@ Usage:
 import argparse
 import time
 
+import torch
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -19,7 +21,7 @@ import pygame
 from car_env import CarEnv
 from dqn_agent import DQNAgent
 
-MODEL_PATH = "dqn_model.pth"
+MODEL_PATH = "dqn_model_v2.pth"
 PLOT_PATH = "training_plot.png"
 
 
@@ -56,9 +58,31 @@ def plot_scores(scores, path=PLOT_PATH):
 LEARN_EVERY = 4
 
 
-def train(num_episodes=2000, max_steps=250):
+def _resolve_device(kind: str) -> torch.device:
+    """Pick torch device from CLI: auto | cuda | cpu."""
+    kind = kind.lower()
+    if kind == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if kind == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit(
+                "CUDA requested (--device cuda) but torch.cuda.is_available() is False. "
+                "Install a CUDA-capable PyTorch build, check your GPU driver, or use "
+                "--device cpu or --device auto."
+            )
+        return torch.device("cuda")
+    if kind == "cpu":
+        return torch.device("cpu")
+    raise SystemExit(f"Unknown --device {kind!r}; use auto, cuda, or cpu.")
+
+
+def train(
+    num_episodes: int = 4000,
+    max_steps: int = 80,
+    device: torch.device | None = None,
+):
     env = CarEnv(render_mode=None, max_steps=max_steps)
-    agent = DQNAgent()
+    agent = DQNAgent(device=device)
 
     scores = []
     best_avg = -float("inf")
@@ -103,9 +127,13 @@ def train(num_episodes=2000, max_steps=250):
     plot_scores(scores)
 
 
-def evaluate(num_episodes=5, max_steps=500):
+def evaluate(
+    num_episodes: int = 5,
+    max_steps: int = 500,
+    device: torch.device | None = None,
+):
     env = CarEnv(render_mode="human", max_steps=max_steps)
-    agent = DQNAgent()
+    agent = DQNAgent(device=device)
     agent.load(MODEL_PATH)
     agent.epsilon = 0.0
 
@@ -138,10 +166,14 @@ def evaluate(num_episodes=5, max_steps=500):
     env.close()
 
 
-def evaluate_headless(num_episodes=20, max_steps=500):
+def evaluate_headless(
+    num_episodes: int = 20,
+    max_steps: int = 500,
+    device: torch.device | None = None,
+):
     """Run the trained agent without any graphics — prints stats only."""
     env = CarEnv(render_mode=None, max_steps=max_steps)
-    agent = DQNAgent()
+    agent = DQNAgent(device=device)
     agent.load(MODEL_PATH)
     agent.epsilon = 0.0
 
@@ -189,16 +221,26 @@ if __name__ == "__main__":
              "'eval-headless' to test without graphics",
     )
     parser.add_argument(
-        "--episodes", type=int, default=2000, help="Number of episodes"
+        "--episodes", type=int, default=4000, help="Number of episodes"
     )
     parser.add_argument(
-        "--max-steps", type=int, default=250, help="Max steps per episode (training)"
+        "--max-steps", type=int, default=80, help="Max steps per episode (training)"
+    )
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help=(
+            "Torch device for the DQN: auto selects CUDA when available else CPU; "
+            "cuda requires a GPU."
+        ),
     )
     args = parser.parse_args()
+    device = _resolve_device(args.device)
 
     if args.mode == "train":
-        train(num_episodes=args.episodes, max_steps=args.max_steps)
+        train(num_episodes=args.episodes, max_steps=args.max_steps, device=device)
     elif args.mode == "eval":
-        evaluate()
+        evaluate(device=device)
     else:
-        evaluate_headless(num_episodes=args.episodes)
+        evaluate_headless(num_episodes=args.episodes, device=device)

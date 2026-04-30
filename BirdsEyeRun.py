@@ -21,9 +21,12 @@ Behavior:
     - The program never auto-terminates. The only exit path is the user
       pressing 'q'. Detection failures and reaching the target both keep the
       loop alive.
-    - When the car is within --reach-threshold pixels of the target, action 4
-      (no-op / full stop) is sent every tick until the target is moved
-      (distance grows past threshold * 1.4) or the user quits.
+    - When the car is within the target reach radius (after TARGET_RADIUS_BUFFER),
+      action 4 (no-op / full stop) is sent every tick until the target is moved
+      or the user quits.
+    - After first entering the reach zone, --reach-settle-seconds (default 0.35)
+      suppresses DQN and keeps sending no-op so coasting / jitter does not
+      immediately trigger forward/back oscillation. Use 0 to disable.
     - When either detector fails, an error message is printed identifying
       which one failed, action 4 is sent, and detection is retried on the
       next frame.
@@ -77,7 +80,7 @@ ACTION_LABELS = {
 
 NO_OP_ACTION = 4
 
-TARGET_RADIUS_BUFFER = 1.20
+TARGET_RADIUS_BUFFER = 4.25
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -128,6 +131,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Skip opening the serial port; actions are only printed. Useful "
             "for testing the perception + DQN path without the car attached."
+        ),
+    )
+    parser.add_argument(
+        "--reach-settle-seconds",
+        type=float,
+        default=0.35,
+        help=(
+            "After first entering the reach zone, keep sending no-op and skip DQN "
+            "for this many seconds (dampens overshoot ping-pong). 0 disables."
         ),
     )
     return parser
@@ -234,6 +246,7 @@ def run(args: argparse.Namespace) -> None:
 
     smoother = DetectionSmoother()
     reached = False
+    reach_settle_until: float | None = None
     last_tick = 0.0
 
     try:
@@ -275,6 +288,7 @@ def run(args: argparse.Namespace) -> None:
                 print(failure_reason)
                 _send_action(ser, NO_OP_ACTION, args.no_serial)
                 reached = False
+                reach_settle_until = None
 
                 if args.mode == "gui":
                     which = "car" if car is None else "target"
@@ -311,18 +325,34 @@ def run(args: argparse.Namespace) -> None:
                     f"radius={reach_radius:.1f} px). Holding position. "
                     "Move the target or press 'q' to quit."
                 )
+                if args.reach_settle_seconds > 0.0:
+                    reach_settle_until = now + args.reach_settle_seconds
             elif not reached and prev_reached:
-                print(
-                    f"[BirdsEyeRun] Target moved (dist={dist_px:.1f} px > "
-                    f"radius={reach_radius:.1f} px). Resuming driving."
+                settling = (
+                    reach_settle_until is not None and now < reach_settle_until
                 )
+                if not settling:
+                    print(
+                        f"[BirdsEyeRun] Target moved (dist={dist_px:.1f} px > "
+                        f"radius={reach_radius:.1f} px). Resuming driving."
+                    )
+                    reach_settle_until = None
 
-            if reached:
+            in_settle = (
+                reach_settle_until is not None and now < reach_settle_until
+            )
+            if in_settle:
+                action = NO_OP_ACTION
+                state_label = "SETTLE"
+            elif reached:
                 action = NO_OP_ACTION
                 state_label = "REACHED"
             else:
                 action = int(agent.select_action(vector, evaluate=True))
                 state_label = "DRIVING"
+
+            if reach_settle_until is not None and now >= reach_settle_until:
+                reach_settle_until = None
 
             _send_action(ser, action, args.no_serial)
 

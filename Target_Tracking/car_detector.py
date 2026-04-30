@@ -132,11 +132,11 @@ def _build_red_mask(frame_bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
     mask1 = cv2.inRange(hsv,
-                        np.array([0,   80,  80], np.uint8),
-                        np.array([10, 255, 255], np.uint8))
+                        np.array([0,   70,  80], np.uint8),
+                        np.array([5, 160, 255], np.uint8))
     mask2 = cv2.inRange(hsv,
-                        np.array([160, 80,  80], np.uint8),
-                        np.array([180, 255, 255], np.uint8))
+                        np.array([178, 70,  80], np.uint8),
+                        np.array([180, 160, 255], np.uint8))
     mask = cv2.bitwise_or(mask1, mask2)
 
     k5   = np.ones((5, 5), np.uint8)

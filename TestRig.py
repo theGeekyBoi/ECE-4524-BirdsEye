@@ -25,10 +25,30 @@ CAR_FRONT_COLOR = (30, 200, 255)
 TARGET_COLOR = (60, 220, 255)
 OBSTACLE_COLOR = (220, 70, 70)
 
-CAR_LENGTH = 48
-CAR_WIDTH = 26
-CAR_SPEED = 220.0          # pixels/sec
-CAR_ROT_SPEED = 160.0      # degrees/sec
+# Footprint and drive rates calibrated from the physical car (see calibrate_car.py).
+# The simulator now matches the real car's near-square shape and asymmetric drive.
+CAR_LENGTH = 54
+CAR_WIDTH = 48
+
+# Per-action linear/angular rates (calibration means).
+CAR_FWD_SPEED = 198.0       # pixels/sec, action 0 (forward)
+CAR_BWD_SPEED = 182.0       # pixels/sec, action 1 (backward)
+CAR_CCW_SPEED = 128.0       # degrees/sec, action 2 (rotate left, CCW)
+CAR_CW_SPEED  =  88.0       # degrees/sec, action 3 (rotate right, CW)
+
+# Physics step per agent decision. Matches BirdsEyeRun.py --interval default
+# (1/15 s) so one sim step covers the same time slice the real car spends
+# latched on a single Bluetooth command between BirdsEyeRun ticks.
+STEP_DT = 1.0 / 15.0
+
+# Per-episode randomization: (mean, stdev, lo, hi) for each drive rate.
+# Stdevs are taken from calibrate_car.py's report and clipped to a reasonable
+# physical envelope so a single bad sample cannot break learning.
+RANDOMIZE_DRIVE = True
+FWD_SPEED_DIST = (198.0, 10.0, 170.0, 220.0)
+BWD_SPEED_DIST = (182.0, 20.0, 150.0, 220.0)
+CCW_SPEED_DIST = (128.0, 10.0, 115.0, 145.0)
+CW_SPEED_DIST  = ( 88.0,  7.0,  78.0, 100.0)
 
 TARGET_RADIUS = 16
 
@@ -64,6 +84,11 @@ def random_position(margin):
     return (x, y)
 
 
+def _sample_drive_rate(mean, stdev, lo, hi):
+    """Sample a per-episode drive rate as a clipped Gaussian."""
+    return clamp(random.gauss(mean, stdev), lo, hi)
+
+
 # ----------------------------
 # Entities
 # ----------------------------
@@ -72,8 +97,12 @@ class Car:
         self.pos = pygame.Vector2(pos)
         # Heading angle in degrees, 0 points to the right, positive rotates CCW
         self.angle = 0.0
-        self.speed = CAR_SPEED
-        self.rotation_speed = CAR_ROT_SPEED
+        # Per-action drive rates. Defaults are the calibration means; Game.reset
+        # may overwrite these per episode for domain randomization.
+        self.fwd_speed = CAR_FWD_SPEED
+        self.bwd_speed = CAR_BWD_SPEED
+        self.ccw_speed = CAR_CCW_SPEED
+        self.cw_speed  = CAR_CW_SPEED
 
         self.base_surface = pygame.Surface((CAR_LENGTH, CAR_WIDTH), pygame.SRCALPHA)
         pygame.draw.rect(self.base_surface, CAR_COLOR, self.base_surface.get_rect(), border_radius=4)
@@ -99,15 +128,15 @@ class Car:
         self.prev_angle = self.angle
 
         if action == 2:
-            self.angle += self.rotation_speed * dt
+            self.angle += self.ccw_speed * dt
         if action == 3:
-            self.angle -= self.rotation_speed * dt
+            self.angle -= self.cw_speed * dt
 
         direction = self.forward_vector()
         if action == 0:
-            self.pos += direction * self.speed * dt
+            self.pos += direction * self.fwd_speed * dt
         if action == 1:
-            self.pos -= direction * self.speed * dt
+            self.pos -= direction * self.bwd_speed * dt
 
     def get_render_data(self):
         rotated = pygame.transform.rotate(self.base_surface, self.angle)
@@ -206,7 +235,10 @@ class Game:
         else:
             self.screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
             self.font = None
-        self.dt = 1.0 / FPS
+        # Each agent decision advances physics by STEP_DT (1/15 s), matching
+        # the real car's per-tick command latching window in BirdsEyeRun.py.
+        # FPS is kept only for the human-render loop in run_manual_game.
+        self.dt = STEP_DT
 
         self.car_spawn = (SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
         self.car = Car(self.car_spawn)
@@ -225,6 +257,17 @@ class Game:
 
         self.car.pos = pygame.Vector2(self.car_spawn)
         self.car.angle = 0.0
+
+        if RANDOMIZE_DRIVE:
+            self.car.fwd_speed = _sample_drive_rate(*FWD_SPEED_DIST)
+            self.car.bwd_speed = _sample_drive_rate(*BWD_SPEED_DIST)
+            self.car.ccw_speed = _sample_drive_rate(*CCW_SPEED_DIST)
+            self.car.cw_speed  = _sample_drive_rate(*CW_SPEED_DIST)
+        else:
+            self.car.fwd_speed = CAR_FWD_SPEED
+            self.car.bwd_speed = CAR_BWD_SPEED
+            self.car.ccw_speed = CAR_CCW_SPEED
+            self.car.cw_speed  = CAR_CW_SPEED
 
         self.obstacles = self.generate_obstacles()
         self.place_target()
